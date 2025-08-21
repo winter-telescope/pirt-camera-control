@@ -1,0 +1,7 @@
+.conda
+.env
+.ipynb_checkpoints
+__pycache__/
+*.pyc
+*.pyo
+*egg-info/

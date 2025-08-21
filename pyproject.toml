@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pirt-camera-control"
+version = "0.1.0"
+description = "TCP/IP control interface for PIRT scientific camera with GUI and client library"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Kishalay De", email = ""},
+    {name = "Nate Lourie", email = ""},
+]
+
+keywords = ["camera", "astronomy", "scientific-instrumentation", "fits", "tcp-ip"]
+
+
+dependencies = [
+    "numpy",
+    "astropy",
+    "PyQt5",
+    "matplotlib",
+    "Pyro5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black",
+    "flake8",
+    "mypy",
+    "pre-commit",
+    "ipykernel",
+    "ruff",
+]
+docs = [
+    "sphinx>=5.0",
+    "sphinx-rtd-theme>=1.0",
+]
+examples = [
+    "ipython>=8.0",
+    "jupyter>=1.0",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mirage_control = ["*.json", "*.yaml"]
