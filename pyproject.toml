@@ -10,8 +10,8 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Kishalay De", email = ""},
-    {name = "Nate Lourie", email = ""},
+    {name = "Kishalay De"},
+    {name = "Nate Lourie"},
 ]
 
 keywords = ["camera", "astronomy", "scientific-instrumentation", "fits", "tcp-ip"]
