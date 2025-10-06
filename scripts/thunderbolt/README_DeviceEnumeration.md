@@ -17,16 +17,22 @@ Removes the registry value, reverting to Windows’ default behavior.
 ## Usage
 
 1. Open PowerShell **as Administrator**.
-2. Run the desired script:
+2. Navigate to the folder: 
+    ```powershell:
+    cd ~
+    cd <project_directory>\pirt-camera-control\
+    ```
+
+3. Run the desired script:
     ```powershell
-    .\Enable-DeviceEnumerationBeforeLogon.ps1
+    powershell -ExecutionPolicy Bypass -File .\scripts\thunderbolt\Enable-DeviceEnumerationBeforeLogon.ps1
 
     or
 
     ```powershell:
-    .\Undo-DeviceEnumerationPolicy.ps1
+    powershell -ExecutionPolicy Bypass -File .\scripts\thunderbolt\Undo-DeviceEnumerationPolicy.ps1
     ```
-3. Reboot the machine for the changes to take effect.
+4. Reboot the machine for the changes to take effect.
 
 ⚠️ Note: This disables a DMA protection measure in Windows.
 Only use if you understand the security implications.
