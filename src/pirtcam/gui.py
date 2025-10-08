@@ -342,7 +342,7 @@ class SciCamGUI(QWidget):
                 path = cmd_data.get("path", "")
                 if path:
                     # Expand user paths like ~/data
-                    path = os.path.expanduser(path)
+                    # path = os.path.expanduser(path)
                     # Create directory if it doesn't exist
                     try:
                         os.makedirs(path, exist_ok=True)
@@ -392,7 +392,7 @@ class SciCamGUI(QWidget):
                     "offset_corr": self.state.get("offset_corr", default),
                     "sub_corr": self.state.get("sub_corr", default),
                     "tec_lock": self.state.get("tec_lock", default),
-                    "waiting_on_exposure_update": self.waiting_on_exposure_update,
+                    "waiting_on_exposure_update": int(self.waiting_on_exposure_update),
                 }
                 response = {"status": "success", "data": status}
 
