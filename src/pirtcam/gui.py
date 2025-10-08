@@ -392,6 +392,11 @@ class SciCamGUI(QWidget):
                     "offset_corr": self.state.get("offset_corr", default),
                     "sub_corr": self.state.get("sub_corr", default),
                     "tec_lock": self.state.get("tec_lock", default),
+                    "tec_enabled": self.state.get("tec_enabled", default),
+                    "tec_voltage": self.state.get("tec_voltage", default),
+                    "case_temp": self.state.get("case_temp", default),
+                    "digpcb_temp": self.state.get("digpcb_temp", default),
+                    "senspcb_temp": self.state.get("senspcb_temp", default),
                     "waiting_on_exposure_update": int(self.waiting_on_exposure_update),
                 }
                 response = {"status": "success", "data": status}
