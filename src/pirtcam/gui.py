@@ -120,7 +120,7 @@ class ImageViewer(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MIRAGE Quick Look Viewer")
+        self.setWindowTitle("PIRT Quick Look Viewer")
         self.setGeometry(750, 100, 600, 600)
         self.layout = QVBoxLayout()
         self.image_label = QLabel("No image yet")
@@ -191,7 +191,7 @@ class SciCamGUI(QWidget):
 
     def __init__(self, enable_server=True, server_port=5555):
         super().__init__()
-        self.setWindowTitle("MIRAGE Control Panel")
+        self.setWindowTitle("PIRT Control Panel")
         self.setGeometry(100, 100, 600, 500)
         self.setup_ui()
         self.setup_serial()
@@ -532,6 +532,40 @@ class SciCamGUI(QWidget):
             self.capture_button.setEnabled(False)
             tec_lock_status = 0
         self.state.update({"tec_lock": tec_lock_status})
+
+        # TEC Voltage
+        tec_voltage = self.query_scalar("TEC:V?")
+        if tec_voltage:
+            tec_voltage = float(tec_voltage)
+        self.state.update({"tec_voltage": tec_voltage})
+
+        # Case Temperature
+        case_temp = self.query_scalar("TEMP:CASE?")
+        if case_temp:
+            case_temp = float(case_temp)
+        self.state.update({"case_temp": case_temp})
+
+        # DIGPCB Temperature
+        digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
+        if digpcb_temp:
+            digpcb_temp = float(digpcb_temp)
+        self.state.update({"digpcb_temp": digpcb_temp})
+
+        # SENSPCB Temperature
+        senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
+        if senspcb_temp:
+            senspcb_temp = float(senspcb_temp)
+        self.state.update({"senspcb_temp": senspcb_temp})
+
+        # TEC Status (enabled/disabled)
+        tec_status = self.query_scalar("TEC:EN?")
+        if tec_status and tec_status.strip().upper() == "ON":
+            tec_enabled = 1
+        elif tec_status and tec_status.strip().upper() == "OFF":
+            tec_enabled = 0
+        else:
+            tec_enabled = None
+        self.state.update({"tec_enabled": tec_enabled})
 
     def setup_serial(self):
         self.CL = CLCom.clsCLAllSerial()
