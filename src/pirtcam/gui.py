@@ -200,6 +200,8 @@ class SciCamGUI(QWidget):
         self.exp_input.setValue(1.0)  # GUI default only, no serial write
         self.exp_input.blockSignals(False)
 
+        self.state = {}
+
         self.update_status_indicators()
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status_indicators)
@@ -375,15 +377,22 @@ class SciCamGUI(QWidget):
 
             elif cmd_type == "GET_STATUS":
                 # Get current status
+                default = None
                 status = {
-                    "tec_locked": self.capture_button.isEnabled(),
+                    "tec_locked": self.state.get("tec_lock", default),
                     "exposure": self.exp_input.value(),
-                    "nframes": self.nframes_input.text(),
+                    "nframes": int(self.nframes_input.text()),
                     "object": self.object_input.text(),
                     "observer": self.observer_input.text(),
                     "save_path": self.save_path_input.text(),
-                    "tec_temp": self.dynamic_temp_label.text(),
-                    "tec_setpoint": self.tec_setpoint_label.text(),
+                    "tec_temp": self.state.get("tec_temp", default),
+                    "tec_setpoint": self.state.get("tec_setpoint", default),
+                    "soc": self.state.get("soc", default),
+                    "gain_corr": self.state.get("gain_corr", default),
+                    "offset_corr": self.state.get("offset_corr", default),
+                    "sub_corr": self.state.get("sub_corr", default),
+                    "tec_lock": self.state.get("tec_lock", default),
+                    "waiting_on_exposure_update": self.waiting_on_exposure_update,
                 }
                 response = {"status": "success", "data": status}
 
@@ -458,28 +467,37 @@ class SciCamGUI(QWidget):
 
     def update_status_indicators(self):
         setpoint = self.query_scalar("TEMP:SENS:SET?")
+        self.state.update({"tec_setpoint": setpoint})
         if setpoint:
             self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
+
         temp = self.query_scalar("TEMP:SENS?")
+        self.state.update({"tec_temp": temp})
         if temp:
             self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
+
         soc = self.query_scalar("SOC?")
+        self.state.update({"soc": soc})
         if soc:
             self.soc_label.setText(f"Loaded SOC: {soc}")
 
         gain = self.query_scalar("CORR:GAIN?")
+        self.state.update({"gain_corr": gain})
         if gain:
             self.gaincor_dropdown.setCurrentText(gain.strip().upper())
 
         off = self.query_scalar("CORR:OFFSET?")
+        self.state.update({"offset_corr": off})
         if off:
             self.offcor_dropdown.setCurrentText(off.strip().upper())
 
         sub = self.query_scalar("CORR:SUB?")
+        self.state.update({"sub_corr": sub})
         if sub:
             self.subcor_dropdown.setCurrentText(sub.strip().upper())
 
         tec_lock = self.query_scalar("TEC:LOCK?")
+        self.state.update({"tec_lock": tec_lock})
         if tec_lock and tec_lock.strip().upper() == "ON":
             self.tec_lock_light.setStyleSheet(
                 "background-color: green; border-radius: 8px;"
@@ -490,7 +508,6 @@ class SciCamGUI(QWidget):
                 "background-color: red; border-radius: 8px;"
             )
             self.capture_button.setEnabled(False)
-        soc = self.query_scalar("SOC?")
 
     def setup_serial(self):
         self.CL = CLCom.clsCLAllSerial()
