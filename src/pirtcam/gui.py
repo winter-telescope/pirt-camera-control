@@ -322,6 +322,17 @@ class SciCamGUI(QWidget):
                         "message": "Invalid temperature. Use -20, -40, or -60",
                     }
 
+            elif cmd_type == "TEC_EN":
+                # Enable or disable TEC
+                value = cmd_data.get("value", "").upper()
+
+                if value in ["ON", "OFF"]:
+                    self.send_command(f"TEC:EN {value}")
+                    response = {
+                        "status": "success",
+                        "message": f"TEC enabled set to {value}",
+                    }
+
             elif cmd_type == "SET_OBJECT":
                 # Set object name
                 obj_name = cmd_data.get("object", "")

@@ -700,9 +700,33 @@ class CameraClient:
 
     def set_correction(self, correction_type, value):
         """Set correction parameters (GAIN/OFFSET/SUB, ON/OFF)"""
+        # Enforce valid values:
+        # correction_type: "GAIN", "OFFSET", or "SUB"
+        # value: "ON" or "OFF"
+
+        correction_type = correction_type.upper()
+        value = value.upper()
+        if correction_type not in ["GAIN", "OFFSET", "SUB"]:
+            raise ValueError("correction_type must be 'GAIN', 'OFFSET', or 'SUB'")
+        if value not in ["ON", "OFF"]:
+            raise ValueError("value must be 'ON' or 'OFF'")
+
         return self.send_command(
             {"command": "SET_CORRECTION", "type": correction_type, "value": value}
         )
+
+    def set_tec_enabled(self, value):
+        """Enable or disable TEC cooling (value: 'ON' or 'OFF')"""
+        value = value.upper()
+        # value must be "ON" or "OFF" or a boolean
+        if value not in ["ON", "OFF"] and not isinstance(value, bool):
+            raise ValueError("value must be 'ON' or 'OFF' or a boolean")
+
+        # map True/False to "ON"/"OFF"
+        if isinstance(value, bool):
+            value = "ON" if value else "OFF"
+
+        return self.send_command({"command": "TEC_EN", "value": value})
 
     def is_exposure_updating(self):
         """Check if exposure is currently being updated"""
