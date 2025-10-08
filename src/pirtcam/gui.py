@@ -467,14 +467,17 @@ class SciCamGUI(QWidget):
 
     def update_status_indicators(self):
         setpoint = self.query_scalar("TEMP:SENS:SET?")
-        self.state.update({"tec_setpoint": setpoint})
+
         if setpoint:
+            setpoint = float(setpoint)
             self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
+        self.state.update({"tec_setpoint": setpoint})
 
         temp = self.query_scalar("TEMP:SENS?")
-        self.state.update({"tec_temp": temp})
         if temp:
+            temp = float(temp)
             self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
+        self.state.update({"tec_temp": temp})
 
         soc = self.query_scalar("SOC?")
         self.state.update({"soc": soc})
@@ -482,32 +485,53 @@ class SciCamGUI(QWidget):
             self.soc_label.setText(f"Loaded SOC: {soc}")
 
         gain = self.query_scalar("CORR:GAIN?")
-        self.state.update({"gain_corr": gain})
         if gain:
             self.gaincor_dropdown.setCurrentText(gain.strip().upper())
+            if gain.lower() == "on":
+                gain = 1
+            elif gain.lower() == "off":
+                gain = 0
+            else:
+                gain = None
+        self.state.update({"gain_corr": gain})
 
         off = self.query_scalar("CORR:OFFSET?")
-        self.state.update({"offset_corr": off})
         if off:
             self.offcor_dropdown.setCurrentText(off.strip().upper())
+            if off.lower() == "on":
+                off = 1
+            elif off.lower() == "off":
+                off = 0
+            else:
+                off = None
+        self.state.update({"offset_corr": off})
 
         sub = self.query_scalar("CORR:SUB?")
-        self.state.update({"sub_corr": sub})
         if sub:
             self.subcor_dropdown.setCurrentText(sub.strip().upper())
+            if sub.lower() == "on":
+                sub = 1
+            elif sub.lower() == "off":
+                sub = 0
+            else:
+                sub = None
+        self.state.update({"sub_corr": sub})
 
         tec_lock = self.query_scalar("TEC:LOCK?")
-        self.state.update({"tec_lock": tec_lock})
+
         if tec_lock and tec_lock.strip().upper() == "ON":
             self.tec_lock_light.setStyleSheet(
                 "background-color: green; border-radius: 8px;"
             )
             self.capture_button.setEnabled(True)
+            tec_lock_status = 1
         else:
             self.tec_lock_light.setStyleSheet(
                 "background-color: red; border-radius: 8px;"
             )
             self.capture_button.setEnabled(False)
+            tec_lock_status = 0
+        self.state.update({"tec_lock": tec_lock_status})
 
     def setup_serial(self):
         self.CL = CLCom.clsCLAllSerial()
