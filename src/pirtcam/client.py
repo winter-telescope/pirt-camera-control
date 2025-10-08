@@ -698,6 +698,10 @@ class CameraClient:
         """Get current camera status"""
         return self.send_command({"command": "GET_STATUS"})
 
+    def print_status(self):
+        status = self.get_status()
+        print(json.dumps(status, indent=2))
+
     def set_correction(self, correction_type, value):
         """Set correction parameters (GAIN/OFFSET/SUB, ON/OFF)"""
         # Enforce valid values:
@@ -716,17 +720,38 @@ class CameraClient:
         )
 
     def set_tec_enabled(self, value):
-        """Enable or disable TEC cooling (value: 'ON' or 'OFF')"""
-        value = value.upper()
-        # value must be "ON" or "OFF" or a boolean
-        if value not in ["ON", "OFF"] and not isinstance(value, bool):
-            raise ValueError("value must be 'ON' or 'OFF' or a boolean")
+        """Enable or disable TEC cooling.
 
-        # map True/False to "ON"/"OFF"
+        Parameters
+        ----------
+        value : str | bool | int
+            Accepts: 'ON'/'OFF' (case-insensitive), True/False, 1/0.
+        """
+
+        # Normalize to string
         if isinstance(value, bool):
-            value = "ON" if value else "OFF"
+            norm = "ON" if value else "OFF"
+        elif isinstance(value, int):
+            if value in (0, 1):
+                norm = "ON" if value == 1 else "OFF"
+            else:
+                raise ValueError("Integer value must be 0 or 1")
+        elif isinstance(value, str):
+            val = value.strip().upper()
+            if val in ("ON", "OFF"):
+                norm = val
+            elif val in ("TRUE", "FALSE"):
+                norm = "ON" if val == "TRUE" else "OFF"
+            elif val in ("1", "0"):
+                norm = "ON" if val == "1" else "OFF"
+            else:
+                raise ValueError(
+                    "String value must be 'ON'/'OFF', 'TRUE'/'FALSE', or '1'/'0'"
+                )
+        else:
+            raise ValueError("Unsupported type. Use bool, int, or str.")
 
-        return self.send_command({"command": "TEC_EN", "value": value})
+        return self.send_command({"command": "TEC_EN", "value": norm})
 
     def is_exposure_updating(self):
         """Check if exposure is currently being updated"""
