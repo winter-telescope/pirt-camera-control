@@ -304,11 +304,13 @@ class SciCamGUI(QWidget):
 
             elif cmd_type == "SET_TEC_TEMP":
                 # Set TEC temperature
-                temp = str(cmd_data.get("temperature", -40))
-                if temp in ["-20", "-40", "-60"]:
+                temp = float(cmd_data.get("temperature", -40.0))
+                min_allowed = -60.0
+                max_allowed = 20.0
+                if temp <= max_allowed and temp >= min_allowed:
                     # Block signals to prevent double command sending
                     self.tec_temp_dropdown.blockSignals(True)
-                    self.tec_temp_dropdown.setCurrentText(temp)
+                    self.tec_temp_dropdown.setCurrentText(str(temp))
                     self.tec_temp_dropdown.blockSignals(False)
                     # Manually trigger the TEC temperature change handler
                     self.handle_tec_temp_change(temp)
@@ -319,7 +321,7 @@ class SciCamGUI(QWidget):
                 else:
                     response = {
                         "status": "error",
-                        "message": "Invalid temperature. Use -20, -40, or -60",
+                        "message": f"Invalid temperature. Must be between {min_allowed}°C and {max_allowed}°C",
                     }
 
             elif cmd_type == "TEC_EN":
