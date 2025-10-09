@@ -25,12 +25,12 @@ python
 import pirtcam
 print(pirtcam.__version__)
 ```
-Which should print something like: `'0.2.0.dev0+g5fd9117d0.d20251008'`
+Which should print something like: `'1.3.0.dev1+gdbc561fb3'`
 
-Upgrade to tag to the next appropriate version. Here going to 0.2.0 is appropriate, the text is saying that we are not yet at v0.2.0. 
+Upgrade to tag to the next appropriate version. Here going to 1.3.0 or 1.2.2 is appropriate, the text is saying that we are not yet at v1.3.0. In this case we were previously at v1.2.1.
 
 ```bash:
-git tag -a v0.2.0 -m "message about the new version"
+git tag -a v1.3.0 -m "message about the new version"
 git push origin v0.2.0
 ```
 
