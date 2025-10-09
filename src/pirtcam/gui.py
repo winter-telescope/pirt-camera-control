@@ -467,11 +467,13 @@ class SciCamGUI(QWidget):
                     }
 
             # Send response back to client
-            if self.command_server:
-                self.print_terminal(
-                    f"Sending response: {response['status']} - {response.get('message', '')}"
-                )
-                self.command_server.send_response(json.dumps(response))
+            # mute this for GET_STATUS to reduce spam
+            if cmd_type != "GET_STATUS":
+                if self.command_server:
+                    self.print_terminal(
+                        f"Sending response: {response['status']} - {response.get('message', '')}"
+                    )
+                    self.command_server.send_response(json.dumps(response))
 
         except json.JSONDecodeError:
             response = {"status": "error", "message": "Invalid JSON command"}
