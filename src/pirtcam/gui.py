@@ -495,7 +495,10 @@ class SciCamGUI(QWidget):
 
         temp = self.query_scalar("TEMP:SENS?")
         if temp:
-            temp = float(temp)
+            try:
+                temp = float(temp)
+            except Exception:
+                temp = -888.0
             self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
         self.state.update({"tec_temp": temp})
 
@@ -556,25 +559,37 @@ class SciCamGUI(QWidget):
         # TEC Voltage
         tec_voltage = self.query_scalar("TEC:V?")
         if tec_voltage:
-            tec_voltage = float(tec_voltage)
+            try:
+                tec_voltage = float(tec_voltage)
+            except Exception:
+                tec_voltage = -888.0
         self.state.update({"tec_voltage": tec_voltage})
 
         # Case Temperature
         case_temp = self.query_scalar("TEMP:CASE?")
         if case_temp:
-            case_temp = float(case_temp)
+            try:
+                case_temp = float(case_temp)
+            except Exception:
+                case_temp = -888.0
         self.state.update({"case_temp": case_temp})
 
         # DIGPCB Temperature
         digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
         if digpcb_temp:
-            digpcb_temp = float(digpcb_temp)
+            try:
+                digpcb_temp = float(digpcb_temp)
+            except Exception:
+                digpcb_temp = -888.0
         self.state.update({"digpcb_temp": digpcb_temp})
 
         # SENSPCB Temperature
         senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
         if senspcb_temp:
-            senspcb_temp = float(senspcb_temp)
+            try:
+                senspcb_temp = float(senspcb_temp)
+            except Exception:
+                senspcb_temp = -888.0
         self.state.update({"senspcb_temp": senspcb_temp})
 
         # TEC Status (enabled/disabled)
