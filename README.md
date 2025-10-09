@@ -16,6 +16,24 @@ Try this:
 5. Update pip: `pip install --upgrade pip`
 6. Install dependencies: `pip install -e .` Alternately if you want to install the dev dependencies: `pip install -e ".[dev]"`
 
+## Workflow for updating tags
+Check the current version:
+```bash:
+python
+```
+```python:
+import pirtcam
+print(pirtcam.__version__)
+```
+Which should print something like: `'0.2.0.dev0+g5fd9117d0.d20251008'`
+
+Upgrade to tag to the next appropriate version. Here going to 0.2.0 is appropriate, the text is saying that we are not yet at v0.2.0. 
+
+```bash:
+git tag -a v0.2.0 -m "message about the new version"
+git push origin v0.2.0
+```
+
 ## License
 
 This project is licensed under the MIT License.
