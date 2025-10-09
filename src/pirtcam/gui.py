@@ -485,8 +485,12 @@ class SciCamGUI(QWidget):
         setpoint = self.query_scalar("TEMP:SENS:SET?")
 
         if setpoint:
-            setpoint = float(setpoint)
+            try:
+                setpoint = float(setpoint)
+            except Exception:
+                setpoint = -888.0
             self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
+
         self.state.update({"tec_setpoint": setpoint})
 
         temp = self.query_scalar("TEMP:SENS?")
