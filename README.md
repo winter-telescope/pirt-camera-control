@@ -31,7 +31,7 @@ Upgrade to tag to the next appropriate version. Here going to 1.3.0 or 1.2.2 is 
 
 ```bash:
 git tag -a v1.3.0 -m "message about the new version"
-git push origin v0.2.0
+git push origin v1.3.1
 ```
 
 ## License
