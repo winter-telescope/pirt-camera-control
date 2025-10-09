@@ -892,6 +892,13 @@ class SciCamGUI(QWidget):
                 self.print_terminal("Could not read current TEC setpoint.")
                 return
 
+            self.send_command(f"TEMP:SENS:SET {target}")
+            """
+            # Old warmup procedure (now disabled)
+            # which enforces slow ramp.
+            # The idea is good but the implementation is bad and blocking.
+            # TODO: Re-implement with non-blocking approach
+            
             if abs(current + 60.0) < 1.0 and target > -60:
                 for step in [-55, -50, -45]:
                     if step > target:
@@ -901,6 +908,7 @@ class SciCamGUI(QWidget):
                     self.wait_for_tec_lock(timeout_sec=300)
             self.print_terminal(f"Final TEC setpoint: {target}°C")
             self.send_command(f"TEMP:SENS:SET {target}")
+            """
         except Exception as e:
             self.print_terminal(f"Error during TEC warm-up: {e}")
 
