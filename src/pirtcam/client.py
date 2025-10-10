@@ -216,8 +216,8 @@ class CameraClient:
     def capture_frames(
         self,
         nframes=1,
-        wait_for_completion=True,
-        show_progress=True,
+        wait_for_completion=False,
+        show_progress=False,
         headers=None,
         stack=False,
         filename=None,
@@ -642,7 +642,7 @@ class CameraClient:
                 break
             time.sleep(0.1)
 
-    def set_exposure(self, exposure_seconds, wait=True, debug=False):
+    def set_exposure(self, exposure_seconds, wait=False, debug=False):
         """
         Set exposure time in seconds
 

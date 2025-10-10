@@ -829,17 +829,40 @@ class SciCamGUI(QWidget):
 
         # Calculate capture time remaining
         capture_time_remaining = 0.0
+        exposure_time_remaining = 0.0
+
         if self.is_capturing:
             if self.frame_start_time:
                 frame_elapsed = time.time() - self.frame_start_time
                 expected_frame_time = self.current_exposure_time + 2.0
                 frame_remaining = max(0.0, expected_frame_time - frame_elapsed)
+
+                # Calculate exposure time remaining (without overhead)
+                exposure_time_remaining = max(
+                    0.0, self.current_exposure_time - frame_elapsed
+                )
             else:
                 frame_remaining = self.current_exposure_time + 2.0
+                exposure_time_remaining = self.current_exposure_time
 
             frames_left = self.total_frames - self.current_frame
             remaining_frames_time = frames_left * (self.current_exposure_time + 2.0)
             capture_time_remaining = frame_remaining + remaining_frames_time
+
+            # Update progress bar for exposure time
+            if self.current_exposure_time > 0:
+                # Set maximum to exposure time in tenths of seconds for smooth animation
+                max_val = int(self.current_exposure_time * 10)
+                current_val = int(exposure_time_remaining * 10)
+                self.capture_progress.setMaximum(max_val)
+                self.capture_progress.setValue(current_val)
+                self.capture_progress.setFormat(
+                    f"Exposure: {exposure_time_remaining:.1f}s remaining"
+                )
+        else:
+            # Reset progress bar when not capturing
+            self.capture_progress.setValue(0)
+            self.capture_progress.setFormat("Exposure: Idle")
 
         self.state.update({"capture_time_remaining": capture_time_remaining})
 
@@ -865,15 +888,11 @@ class SciCamGUI(QWidget):
                 f"Capture: Frame {self.current_frame}/{self.total_frames}"
             )
             self.capture_progress_label.setText(
-                f"Time remaining: {capture_time_remaining:.1f}s"
+                f"Total time remaining: {capture_time_remaining:.1f}s"
             )
-            # Update progress bar
-            self.capture_progress.setValue(self.current_frame)
-            self.capture_progress.setMaximum(self.total_frames)
         else:
             self.capture_status_label.setText("Capture: Idle")
             self.capture_progress_label.setText("Progress: N/A")
-            self.capture_progress.setValue(0)
 
     def on_capture_status_update(self, status):
         """Handle status updates from capture thread"""
@@ -883,8 +902,8 @@ class SciCamGUI(QWidget):
         """Handle frame capture progress"""
         self.current_frame = current
         self.total_frames = total
-        self.capture_progress.setValue(current)
-        self.capture_progress.setMaximum(total)
+        self.frame_start_time = time.time()  # Reset timer for new frame's exposure
+        # Progress bar updates are now handled by update_time_fields()
 
     def on_capture_complete(self):
         """Handle capture completion"""
@@ -1179,10 +1198,24 @@ class SciCamGUI(QWidget):
         self.capture_button.clicked.connect(self.capture_frame)
         layout.addWidget(self.capture_button)
 
-        # Add progress bar below capture button
+        # Add progress bar below capture button - configured for exposure time
         self.capture_progress = QProgressBar()
         self.capture_progress.setTextVisible(True)
-        self.capture_progress.setFormat("Frame %v of %m")
+        self.capture_progress.setFormat("Exposure: Idle")
+        self.capture_progress.setStyleSheet(
+            """
+            QProgressBar {
+                text-align: center;
+                border: 1px solid grey;
+                border-radius: 3px;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 2px;
+            }
+        """
+        )
         layout.addWidget(self.capture_progress)
 
         self.status_label = QLabel("Status: Idle")
@@ -1316,9 +1349,28 @@ class SciCamGUI(QWidget):
 
     def on_exposure_changed(self):
         """Handle exposure time changes from GUI"""
+        new_exp = self.exp_input.value()
+
+        # Check if exposure is actually changing
+        current_exp_str = self.query_scalar("SENS:EXPPER?")
+        if current_exp_str:
+            try:
+                CLOCK_FREQ = 15.0
+                current_cycles = int(current_exp_str)
+                current_exp_seconds = current_cycles / (CLOCK_FREQ * 1e6)
+
+                # If exposure is within 0.001s of current, no need to change
+                if abs(current_exp_seconds - new_exp) < 0.001:
+                    self.print_terminal(
+                        f"Exposure already set to {new_exp}s, no change needed"
+                    )
+                    return True
+            except ValueError:
+                pass  # Continue with normal exposure setting if can't parse
+
+        # Proceed with exposure change
         self.waiting_on_exposure_update = True
         self.exposure_update_start_time = time.time()
-        new_exp = self.exp_input.value()
 
         # Use set_exposure method for consistency
         if not self.set_exposure(new_exp):
