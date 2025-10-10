@@ -391,7 +391,7 @@ class SciCamGUI(QWidget):
             elif cmd_type == "GET_STATUS":
                 # Get current status
                 default = None
-                print(f"Current state: {self.state}")
+                # print(f"Current state: {self.state}")
                 status = {
                     "tec_locked": self.state.get("tec_lock", default),
                     "exposure": self.exp_input.value(),
@@ -468,13 +468,13 @@ class SciCamGUI(QWidget):
                     }
 
             # Send response back to client
-            # mute this for GET_STATUS to reduce spam
-            if cmd_type != "GET_STATUS":
-                if self.command_server:
+            if self.command_server:
+                # Only print to terminal for non-GET_STATUS commands to reduce spam
+                if cmd_type != "GET_STATUS":
                     self.print_terminal(
                         f"Sending response: {response['status']} - {response.get('message', '')}"
                     )
-                    self.command_server.send_response(json.dumps(response))
+                self.command_server.send_response(json.dumps(response))
 
         except json.JSONDecodeError:
             response = {"status": "error", "message": "Invalid JSON command"}
