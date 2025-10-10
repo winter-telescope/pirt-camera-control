@@ -391,6 +391,7 @@ class SciCamGUI(QWidget):
             elif cmd_type == "GET_STATUS":
                 # Get current status
                 default = None
+                print(f"Current state: {self.state}")
                 status = {
                     "tec_locked": self.state.get("tec_lock", default),
                     "exposure": self.exp_input.value(),
