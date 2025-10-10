@@ -202,6 +202,14 @@ class SciCamGUI(QWidget):
 
         self.state = {}
 
+        # Add capture tracking variables
+        self.is_capturing = False
+        self.capture_start_time = None
+        self.current_frame = 0
+        self.total_frames = 0
+        self.frame_start_time = None
+        self.current_exposure_time = 0.0
+
         self.update_status_indicators()
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status_indicators)
@@ -391,7 +399,7 @@ class SciCamGUI(QWidget):
             elif cmd_type == "GET_STATUS":
                 # Get current status
                 default = None
-                # print(f"Current state: {self.state}")
+                print(f"Current state: {self.state}")
                 status = {
                     "tec_locked": self.state.get("tec_lock", default),
                     "exposure": self.exp_input.value(),
@@ -405,13 +413,20 @@ class SciCamGUI(QWidget):
                     "gain_corr": self.state.get("gain_corr", default),
                     "offset_corr": self.state.get("offset_corr", default),
                     "sub_corr": self.state.get("sub_corr", default),
-                    "tec_lock": self.state.get("tec_lock", default),
                     "tec_enabled": self.state.get("tec_enabled", default),
                     "tec_voltage": self.state.get("tec_voltage", default),
                     "case_temp": self.state.get("case_temp", default),
                     "digpcb_temp": self.state.get("digpcb_temp", default),
                     "senspcb_temp": self.state.get("senspcb_temp", default),
                     "waiting_on_exposure_update": int(self.waiting_on_exposure_update),
+                    "ready": self.state.get("ready", False),
+                    "timeout_remaining": self.state.get("timeout_remaining", 0.0),
+                    "is_capturing": self.state.get("is_capturing", False),
+                    "current_frame": self.state.get("current_frame", 0),
+                    "total_frames": self.state.get("total_frames", 0),
+                    "capture_time_remaining": self.state.get(
+                        "capture_time_remaining", 0.0
+                    ),
                 }
                 response = {"status": "success", "data": status}
 
@@ -546,6 +561,7 @@ class SciCamGUI(QWidget):
         self.state.update({"sub_corr": sub})
 
         tec_lock = self.query_scalar("TEC:LOCK?")
+        tec_lock_status = 0  # Default to not locked
 
         if tec_lock and tec_lock.strip().upper() == "ON":
             self.tec_lock_light.setStyleSheet(
@@ -607,6 +623,71 @@ class SciCamGUI(QWidget):
             tec_enabled = None
         self.state.update({"tec_enabled": tec_enabled})
 
+        # Calculate ready status (True if not waiting on exposure and TEC is locked and not capturing)
+        tec_locked = tec_lock_status == 1
+        is_ready = (
+            not self.waiting_on_exposure_update and tec_locked and not self.is_capturing
+        )
+        self.state.update({"ready": is_ready})
+
+        # Calculate timeout remaining for exposure update
+        timeout_remaining = 0.0
+        if self.waiting_on_exposure_update and hasattr(self, "exposure_wait_end_time"):
+            timeout_remaining = max(0.0, self.exposure_wait_end_time - time.time())
+        self.state.update({"timeout_remaining": timeout_remaining})
+
+        # Add capture/exposure status
+        self.state.update({"is_capturing": self.is_capturing})
+        self.state.update({"current_frame": self.current_frame})
+        self.state.update({"total_frames": self.total_frames})
+
+        # Calculate capture time remaining
+        capture_time_remaining = 0.0
+        if self.is_capturing:
+            # Time remaining for current frame (exposure + overhead)
+            if self.frame_start_time:
+                frame_elapsed = time.time() - self.frame_start_time
+                expected_frame_time = self.current_exposure_time + 2.0  # Add overhead
+                frame_remaining = max(0.0, expected_frame_time - frame_elapsed)
+            else:
+                frame_remaining = self.current_exposure_time + 2.0
+
+            # Time for remaining frames
+            frames_left = self.total_frames - self.current_frame
+            remaining_frames_time = frames_left * (self.current_exposure_time + 2.0)
+
+            capture_time_remaining = frame_remaining + remaining_frames_time
+
+        self.state.update({"capture_time_remaining": capture_time_remaining})
+
+        # Update visual indicators
+        if is_ready:
+            self.ready_light.setStyleSheet(
+                "background-color: green; border-radius: 8px;"
+            )
+        else:
+            self.ready_light.setStyleSheet(
+                "background-color: yellow; border-radius: 8px;"
+            )
+
+        # Update timeout label
+        if timeout_remaining > 0:
+            self.timeout_label.setText(f"Timeout: {timeout_remaining:.1f}s")
+        else:
+            self.timeout_label.setText("Timeout: N/A")
+
+        # Update capture status labels
+        if self.is_capturing:
+            self.capture_status_label.setText(
+                f"Capture: Frame {self.current_frame}/{self.total_frames}"
+            )
+            self.capture_progress_label.setText(
+                f"Time remaining: {capture_time_remaining:.1f}s"
+            )
+        else:
+            self.capture_status_label.setText("Capture: Idle")
+            self.capture_progress_label.setText("Progress: N/A")
+
     def setup_serial(self):
         self.CL = CLCom.clsCLAllSerial()
         self.CL.SerialInit(0)
@@ -645,6 +726,14 @@ class SciCamGUI(QWidget):
         tec_lock_row.addWidget(QLabel("TEC Lock:"))
         tec_lock_row.addWidget(self.tec_lock_light)
 
+        # Add ready status indicator
+        self.ready_light = QLabel()
+        self.ready_light.setFixedSize(16, 16)
+        self.ready_light.setStyleSheet("background-color: gray; border-radius: 8px;")
+        ready_row = QHBoxLayout()
+        ready_row.addWidget(QLabel("Ready:"))
+        ready_row.addWidget(self.ready_light)
+
         labels_layout.addWidget(self.soc_label)
         labels_layout.addWidget(QLabel("Gain Corr:"))
         labels_layout.addWidget(self.gaincor_dropdown)
@@ -653,6 +742,19 @@ class SciCamGUI(QWidget):
         labels_layout.addWidget(QLabel("Subst Corr:"))
         labels_layout.addWidget(self.subcor_dropdown)
         labels_layout.addLayout(tec_lock_row)
+        labels_layout.addLayout(ready_row)
+
+        # Add timeout remaining label
+        self.timeout_label = QLabel("Timeout: N/A")
+        labels_layout.addWidget(self.timeout_label)
+
+        # Add capture status indicators
+        self.capture_status_label = QLabel("Capture: Idle")
+        labels_layout.addWidget(self.capture_status_label)
+
+        self.capture_progress_label = QLabel("Progress: N/A")
+        labels_layout.addWidget(self.capture_progress_label)
+
         self.dynamic_temp_label = QLabel("Temp (°C): Unknown")
         labels_layout.addWidget(self.dynamic_temp_label)
 
@@ -896,24 +998,8 @@ class SciCamGUI(QWidget):
                 return
 
             self.send_command(f"TEMP:SENS:SET {target}")
-            """
-            # Old warmup procedure (now disabled)
-            # which enforces slow ramp.
-            # The idea is good but the implementation is bad and blocking.
-            # TODO: Re-implement with non-blocking approach
-            
-            if abs(current + 60.0) < 1.0 and target > -60:
-                for step in [-55, -50, -45]:
-                    if step > target:
-                        break
-                    self.print_terminal(f"Warming up: setting TEC to {step}°C")
-                    self.send_command(f"TEMP:SENS:SET {step}")
-                    self.wait_for_tec_lock(timeout_sec=300)
-            self.print_terminal(f"Final TEC setpoint: {target}°C")
-            self.send_command(f"TEMP:SENS:SET {target}")
-            """
         except Exception as e:
-            self.print_terminal(f"Error during TEC warm-up: {e}")
+            self.print_terminal(f"Error during TEC temperature change: {e}")
 
     def wait_for_tec_lock(self, timeout_sec=300):
         self.print_terminal("Waiting for TEC to lock...")
@@ -1045,6 +1131,13 @@ class SciCamGUI(QWidget):
             self.print_terminal("Invalid number of frames; defaulting to 1")
             nframes = 1
 
+        # Set capture tracking state
+        self.is_capturing = True
+        self.capture_start_time = time.time()
+        self.total_frames = nframes
+        self.current_frame = 0
+        self.current_exposure_time = self.exp_input.value()
+
         self.CL.SerialClose()
 
         # Initialize list for stacking if needed
@@ -1053,6 +1146,9 @@ class SciCamGUI(QWidget):
         stack_filename = None
 
         for i in range(nframes):
+            self.current_frame = i + 1
+            self.frame_start_time = time.time()
+
             self.status_label.setText(f"Status: Waiting for frame {i+1}/{nframes}...")
 
             CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
@@ -1287,7 +1383,14 @@ class SciCamGUI(QWidget):
                 }
                 self.command_server.send_response(json.dumps(notification))
 
-        # Reset capture settings
+        # Reset capture state
+        self.is_capturing = False
+        self.capture_start_time = None
+        self.current_frame = 0
+        self.total_frames = 0
+        self.frame_start_time = None
+
+        # Reset other capture settings
         self.custom_headers = {}
         self.save_as_stack = False
         self.custom_filename = None
