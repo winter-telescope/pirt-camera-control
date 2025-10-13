@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 from datetime import datetime, timezone
+from enum import Enum, auto
 
 import BFModule.BufferAcquisition as Buf
 import BFModule.CLComm as CLCom
@@ -476,6 +477,14 @@ class CaptureThread(QThread):
             self.parent.print_terminal(f"Capture error: {e}")
 
 
+class CameraState(Enum):
+    READY = auto()
+    SETTING_EXPOSURE = auto()
+    TEC_SETTLING = auto()
+    EXPOSING = auto()
+    ERROR = auto()
+
+
 class SciCamGUI(QWidget):
     waiting_on_exposure_update = False
 
@@ -491,6 +500,9 @@ class SciCamGUI(QWidget):
         self.exp_input.blockSignals(False)
 
         self.state = {}
+
+        # Enum to track the camera gui state
+        self.camera_state = CameraState.READY
 
         # Add capture tracking variables
         self.is_capturing = False
@@ -705,7 +717,7 @@ class SciCamGUI(QWidget):
             elif cmd_type == "GET_STATUS":
                 # Get current status
                 default = None
-                print(f"Current state: {self.state}")
+                # print(f"Current state: {self.state}")
                 status = {
                     "tec_locked": self.state.get("tec_lock", default),
                     "exposure": self.exp_input.value(),
@@ -733,6 +745,7 @@ class SciCamGUI(QWidget):
                     "capture_time_remaining": self.state.get(
                         "capture_time_remaining", 0.0
                     ),
+                    "camera_state": self.camera_state.name,
                 }
                 response = {"status": "success", "data": status}
 
@@ -811,6 +824,33 @@ class SciCamGUI(QWidget):
         """Fast update for time-based fields only"""
         # Calculate ready status
         tec_locked = self.state.get("tec_lock", 0) == 1
+
+        # Check what CameraState we are in
+        if self.is_capturing:
+            self.camera_state = CameraState.EXPOSING
+        elif self.waiting_on_exposure_update:
+            self.camera_state = CameraState.SETTING_EXPOSURE
+        elif tec_locked:
+            self.camera_state = CameraState.READY
+        else:
+            # TEC is not locked
+            self.camera_state = CameraState.TEC_SETTLING
+
+        # Update the GUI:
+        # Update camera state label
+        self.camera_state_label.setText(f"State: {self.camera_state.name}")
+        # Color code the state
+        if self.camera_state == CameraState.READY:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: green;")
+        elif self.camera_state == CameraState.SETTING_EXPOSURE:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: orange;")
+        elif self.camera_state == CameraState.EXPOSING:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: blue;")
+        elif self.camera_state == CameraState.TEC_SETTLING:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: purple;")
+        elif self.camera_state == CameraState.ERROR:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: red;")
+
         is_ready = (
             not self.waiting_on_exposure_update and tec_locked and not self.is_capturing
         )
@@ -921,7 +961,11 @@ class SciCamGUI(QWidget):
     def on_capture_error(self, error_msg):
         """Handle capture errors"""
         self.print_terminal(f"Capture error: {error_msg}")
+        self.camera_state = CameraState.ERROR
+        self.state.update({"camera_state": self.camera_state.name})
         self.on_capture_complete()  # Reset state
+        # Keep the state in error until next successful operation that is not GET_STATUS
+        # TODO:Add better handling of errors and thoughtful recovery
 
     def on_image_ready(self, img):
         """Handle new image for display"""
@@ -1101,6 +1145,11 @@ class SciCamGUI(QWidget):
         ready_row = QHBoxLayout()
         ready_row.addWidget(QLabel("Ready:"))
         ready_row.addWidget(self.ready_light)
+
+        # Add camera state label (add this after the ready indicator)
+        self.camera_state_label = QLabel("State: READY")
+        self.camera_state_label.setStyleSheet("font-weight: bold;")
+        labels_layout.addWidget(self.camera_state_label)
 
         labels_layout.addWidget(self.soc_label)
         labels_layout.addWidget(QLabel("Gain Corr:"))

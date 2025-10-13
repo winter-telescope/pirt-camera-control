@@ -627,6 +627,31 @@ class CameraClient:
         """Get history of all captures in this session"""
         return [cap.to_dict() for cap in self.capture_history]
 
+    def get_camera_state(self):
+        """Get the current camera state"""
+        status = self.get_status()
+        if status.get("status") == "success":
+            return status["data"].get("camera_state", "UNKNOWN")
+        return "ERROR"
+
+    def wait_for_state(self, target_state, timeout=60):
+        """Wait for camera to reach a specific state
+
+        Args:
+            target_state: One of "READY", "SETTING_EXPOSURE", "EXPOSING", "ERROR"
+            timeout: Maximum time to wait in seconds
+
+        Returns:
+            True if target state reached, False if timeout
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            current_state = self.get_camera_state()
+            if current_state == target_state:
+                return True
+            time.sleep(0.5)
+        return False
+
     def wait_for_current_capture(self, timeout=None):
         """Wait for current capture to complete"""
         if not self.current_capture:
