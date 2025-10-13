@@ -87,9 +87,12 @@ class CommandServer(QThread):
                     command = data.decode("utf-8").strip()
                     if command:
                         # only print if the command is not GET_STATUS
-                        if command["command"] != "GET_STATUS":
-                            print(f"Received command: {command}")
-                            self.command_received.emit(command)
+                        try:
+                            if command["command"] != "GET_STATUS":
+                                print(f"Received command: {command}")
+                        except Exception as e:
+                            print(e)
+                        self.command_received.emit(command)
 
                 except socket.timeout:
                     continue
