@@ -196,10 +196,12 @@ class CameraClient:
         while not self.response_queue.empty():
             self.response_queue.get()
 
-        # Send command
-        command_json = json.dumps(command_dict)
+        # Send command with newline delimiter
+        command_json = json.dumps(command_dict) + "\n"  # ADD THIS NEWLINE
         if hasattr(self, "_debug") and self._debug:
-            print(f"[CLIENT DEBUG] Sending: {command_json}")
+            print(
+                f"[CLIENT DEBUG] Sending: {command_json[:200]}..."
+            )  # Truncate long messages
         self.socket.send(command_json.encode("utf-8"))
 
         # Wait for primary response

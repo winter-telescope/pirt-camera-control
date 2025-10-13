@@ -79,7 +79,7 @@ class CommandServer(QThread):
         try:
             while self.running:
                 try:
-                    data = client.recv(1024)
+                    data = client.recv(4096)
                     if not data:
                         break
 
