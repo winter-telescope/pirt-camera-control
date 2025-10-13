@@ -340,6 +340,7 @@ class CaptureThread(QThread):
                             if key in ["EXPTIME", "FRMTIME"] and val.isdigit():
                                 val = int(val)
                                 val = val / (CLOCK_FREQ_MHZ * 1e6)
+                                val = np.round(val, 3)
                             elif key == "CLKFREQ":
                                 val = float(val.strip("MHZmhz")) * 1e6
                             elif key in ["XSIZE", "YSIZE", "XSTART", "YSTART"]:
@@ -1464,7 +1465,7 @@ class SciCamGUI(QWidget):
             try:
                 CLOCK_FREQ = 15.0
                 current_cycles = int(current_exp_str)
-                current_exp_seconds = current_cycles / (CLOCK_FREQ * 1e6)
+                current_exp_seconds = np.round(current_cycles / (CLOCK_FREQ * 1e6), 3)
 
                 # If exposure is within 0.001s of current, no need to change
                 if abs(current_exp_seconds - new_exp) < 0.001:

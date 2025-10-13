@@ -222,6 +222,8 @@ class CameraClient:
         stack=False,
         filename=None,
         debug=False,
+        object=None,
+        observer=None,
     ):
         """
         Capture one or more frames
@@ -246,6 +248,13 @@ class CameraClient:
             print(f"[DEBUG] Stack mode: {stack}")
             if filename:
                 print(f"[DEBUG] Custom filename: {filename}")
+
+        # If object or observer provided, set them first
+        if object:
+            self.set_object_name(object)
+
+        if observer:
+            self.set_observer_name(observer)
 
         # Get current exposure time for progress estimation
         status = self.get_status()
