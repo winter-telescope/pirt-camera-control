@@ -1030,126 +1030,133 @@ class SciCamGUI(QWidget):
             self.command_server.send_response(json.dumps(notification))
 
     def update_status_indicators(self):
-        setpoint = self.query_scalar("TEMP:SENS:SET?")
 
-        if setpoint:
-            try:
-                setpoint = np.round(float(setpoint), 2)
-            except Exception:
-                setpoint = -888.0
-            self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
-
-        self.state.update({"tec_setpoint": setpoint})
-
-        temp = self.query_scalar("TEMP:SENS?")
-        if temp:
-            try:
-                temp = np.round(float(temp), 2)
-            except Exception:
-                temp = -888.0
-            self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
-        self.state.update({"tec_temp": temp})
-
-        soc = self.query_scalar("SOC?")
-        self.state.update({"soc": soc})
-        if soc:
-            self.soc_label.setText(f"Loaded SOC: {soc}")
-
-        gain = self.query_scalar("CORR:GAIN?")
-        if gain:
-            self.gaincor_dropdown.setCurrentText(gain.strip().upper())
-            if gain.lower() == "on":
-                gain = 1
-            elif gain.lower() == "off":
-                gain = 0
-            else:
-                gain = None
-        self.state.update({"gain_corr": gain})
-
-        off = self.query_scalar("CORR:OFFSET?")
-        if off:
-            self.offcor_dropdown.setCurrentText(off.strip().upper())
-            if off.lower() == "on":
-                off = 1
-            elif off.lower() == "off":
-                off = 0
-            else:
-                off = None
-        self.state.update({"offset_corr": off})
-
-        sub = self.query_scalar("CORR:SUB?")
-        if sub:
-            self.subcor_dropdown.setCurrentText(sub.strip().upper())
-            if sub.lower() == "on":
-                sub = 1
-            elif sub.lower() == "off":
-                sub = 0
-            else:
-                sub = None
-        self.state.update({"sub_corr": sub})
-
-        tec_lock = self.query_scalar("TEC:LOCK?")
-        tec_lock_status = 0  # Default to not locked
-
-        if tec_lock and tec_lock.strip().upper() == "ON":
-            self.tec_lock_light.setStyleSheet(
-                "background-color: green; border-radius: 8px;"
-            )
-            self.capture_button.setEnabled(True)
-            tec_lock_status = 1
+        # Skip all serial queries if we're currently capturing
+        if self.is_capturing:
+            self.print_terminal("Skipping status queries during exposure")
+            return
         else:
-            self.tec_lock_light.setStyleSheet(
-                "background-color: red; border-radius: 8px;"
-            )
-            self.capture_button.setEnabled(False)
-            tec_lock_status = 0
-        self.state.update({"tec_lock": tec_lock_status})
+            # Query the camera status over the serial connection
+            setpoint = self.query_scalar("TEMP:SENS:SET?")
 
-        # TEC Voltage
-        tec_voltage = self.query_scalar("TEC:V?")
-        if tec_voltage:
-            try:
-                tec_voltage = float(tec_voltage)
-            except Exception:
-                tec_voltage = -888.0
-        self.state.update({"tec_voltage": tec_voltage})
+            if setpoint:
+                try:
+                    setpoint = np.round(float(setpoint), 2)
+                except Exception:
+                    setpoint = -888.0
+                self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
 
-        # Case Temperature
-        case_temp = self.query_scalar("TEMP:CASE?")
-        if case_temp:
-            try:
-                case_temp = np.round(float(case_temp), 2)
-            except Exception:
-                case_temp = -888.0
-        self.state.update({"case_temp": case_temp})
+            self.state.update({"tec_setpoint": setpoint})
 
-        # DIGPCB Temperature
-        digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
-        if digpcb_temp:
-            try:
-                digpcb_temp = np.round(float(digpcb_temp), 2)
-            except Exception:
-                digpcb_temp = -888.0
-        self.state.update({"digpcb_temp": digpcb_temp})
+            temp = self.query_scalar("TEMP:SENS?")
+            if temp:
+                try:
+                    temp = np.round(float(temp), 2)
+                except Exception:
+                    temp = -888.0
+                self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
+            self.state.update({"tec_temp": temp})
 
-        # SENSPCB Temperature
-        senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
-        if senspcb_temp:
-            try:
-                senspcb_temp = np.round(float(senspcb_temp), 2)
-            except Exception:
-                senspcb_temp = -888.0
-        self.state.update({"senspcb_temp": senspcb_temp})
+            soc = self.query_scalar("SOC?")
+            self.state.update({"soc": soc})
+            if soc:
+                self.soc_label.setText(f"Loaded SOC: {soc}")
 
-        # TEC Status (enabled/disabled)
-        tec_status = self.query_scalar("TEC:EN?")
-        if tec_status and tec_status.strip().upper() == "ON":
-            tec_enabled = 1
-        elif tec_status and tec_status.strip().upper() == "OFF":
-            tec_enabled = 0
-        else:
-            tec_enabled = None
-        self.state.update({"tec_enabled": tec_enabled})
+            gain = self.query_scalar("CORR:GAIN?")
+            if gain:
+                self.gaincor_dropdown.setCurrentText(gain.strip().upper())
+                if gain.lower() == "on":
+                    gain = 1
+                elif gain.lower() == "off":
+                    gain = 0
+                else:
+                    gain = None
+            self.state.update({"gain_corr": gain})
+
+            off = self.query_scalar("CORR:OFFSET?")
+            if off:
+                self.offcor_dropdown.setCurrentText(off.strip().upper())
+                if off.lower() == "on":
+                    off = 1
+                elif off.lower() == "off":
+                    off = 0
+                else:
+                    off = None
+            self.state.update({"offset_corr": off})
+
+            sub = self.query_scalar("CORR:SUB?")
+            if sub:
+                self.subcor_dropdown.setCurrentText(sub.strip().upper())
+                if sub.lower() == "on":
+                    sub = 1
+                elif sub.lower() == "off":
+                    sub = 0
+                else:
+                    sub = None
+            self.state.update({"sub_corr": sub})
+
+            tec_lock = self.query_scalar("TEC:LOCK?")
+            tec_lock_status = 0  # Default to not locked
+
+            if tec_lock and tec_lock.strip().upper() == "ON":
+                self.tec_lock_light.setStyleSheet(
+                    "background-color: green; border-radius: 8px;"
+                )
+                self.capture_button.setEnabled(True)
+                tec_lock_status = 1
+            else:
+                self.tec_lock_light.setStyleSheet(
+                    "background-color: red; border-radius: 8px;"
+                )
+                self.capture_button.setEnabled(False)
+                tec_lock_status = 0
+            self.state.update({"tec_lock": tec_lock_status})
+
+            # TEC Voltage
+            tec_voltage = self.query_scalar("TEC:V?")
+            if tec_voltage:
+                try:
+                    tec_voltage = float(tec_voltage)
+                except Exception:
+                    tec_voltage = -888.0
+            self.state.update({"tec_voltage": tec_voltage})
+
+            # Case Temperature
+            case_temp = self.query_scalar("TEMP:CASE?")
+            if case_temp:
+                try:
+                    case_temp = np.round(float(case_temp), 2)
+                except Exception:
+                    case_temp = -888.0
+            self.state.update({"case_temp": case_temp})
+
+            # DIGPCB Temperature
+            digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
+            if digpcb_temp:
+                try:
+                    digpcb_temp = np.round(float(digpcb_temp), 2)
+                except Exception:
+                    digpcb_temp = -888.0
+            self.state.update({"digpcb_temp": digpcb_temp})
+
+            # SENSPCB Temperature
+            senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
+            if senspcb_temp:
+                try:
+                    senspcb_temp = np.round(float(senspcb_temp), 2)
+                except Exception:
+                    senspcb_temp = -888.0
+            self.state.update({"senspcb_temp": senspcb_temp})
+
+            # TEC Status (enabled/disabled)
+            tec_status = self.query_scalar("TEC:EN?")
+            if tec_status and tec_status.strip().upper() == "ON":
+                tec_enabled = 1
+            elif tec_status and tec_status.strip().upper() == "OFF":
+                tec_enabled = 0
+            else:
+                tec_enabled = None
+            self.state.update({"tec_enabled": tec_enabled})
 
     def setup_serial(self):
         self.CL = CLCom.clsCLAllSerial()
