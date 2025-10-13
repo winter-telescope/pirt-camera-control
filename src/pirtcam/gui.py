@@ -611,6 +611,7 @@ class SciCamGUI(QWidget):
                         self.command_server.send_response(json.dumps(response))
 
                     # Trigger capture (notifications will be sent as frames are saved)
+                    self.print_terminal("Starting capture from remote command...")
                     self.capture_frame()
                     return  # Don't send response again at the end
 
