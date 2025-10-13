@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from enum import Enum, auto
+from pathlib import Path
 
 import BFModule.BufferAcquisition as Buf
 import BFModule.CLComm as CLCom
@@ -701,26 +702,47 @@ class SciCamGUI(QWidget):
                 }
 
             elif cmd_type == "SET_PATH":
-                # Set save path
-                path = cmd_data.get("path", "")
-                if path:
-                    # Expand user paths like ~/data
-                    # path = os.path.expanduser(path)
-                    # Create directory if it doesn't exist
+                raw_path = cmd_data.get("path")
+
+                if (
+                    not raw_path
+                    or not isinstance(raw_path, str)
+                    or not raw_path.strip()
+                ):
+                    response = {"status": "error", "message": "No path provided"}
+                else:
+                    display_path = raw_path  # keep exactly what user entered for the UI
                     try:
-                        os.makedirs(path, exist_ok=True)
-                        self.save_path_input.setText(path)
+                        # Expand ~ and any environment variables, then normalize
+                        expanded = os.path.expandvars(os.path.expanduser(raw_path))
+                        if not expanded.strip():
+                            raise ValueError("Path resolves to an empty string")
+
+                        p = Path(expanded)
+
+                        # If something exists there and it's not a directory, fail early
+                        if p.exists() and not p.is_dir():
+                            raise NotADirectoryError(
+                                f"Path exists and is not a directory: {p}"
+                            )
+
+                        # Create directory and any missing parents
+                        p.mkdir(parents=True, exist_ok=True)
+
+                        # Show the original (unexpanded) path in the UI
+                        self.save_path_input.setText(display_path)
+
                         response = {
                             "status": "success",
-                            "message": f"Save path set to {path}",
+                            "message": f"Save path set to {display_path}",
+                            # Optionally include the resolved path for callers/logging
+                            "resolved_path": str(p),
                         }
                     except Exception as e:
                         response = {
                             "status": "error",
-                            "message": f"Failed to create directory: {str(e)}",
+                            "message": f"Failed to create directory '{display_path}': {e}",
                         }
-                else:
-                    response = {"status": "error", "message": "No path provided"}
 
             elif cmd_type == "SET_FILENAME":
                 # Set custom filename for next capture
