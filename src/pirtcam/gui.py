@@ -1644,11 +1644,25 @@ class SciCamGUI(QWidget):
                 for key, value in headers_input.items():
                     if isinstance(value, (list, tuple)) and len(value) >= 2:
                         # (key, value, comment) format
-                        hdr[key.upper()] = (
-                            value[0],
-                            value[1] if len(value) > 1 else "",
-                        )
+                        header_value = value[0]
+                        comment = value[1] if len(value) > 1 else ""
+
+                        # Replace None with empty string for FITS compatibility
+                        if header_value is None:
+                            header_value = ""
+                            self.print_terminal(
+                                f"Replacing None value in header {key} with empty string"
+                            )
+
+                        hdr[key.upper()] = (header_value, comment)
                     else:
+                        # Replace None with empty string
+                        if value is None:
+                            value = ""
+                            self.print_terminal(
+                                f"Replacing None value in header {key} with empty string"
+                            )
+
                         hdr[key.upper()] = value
 
             # If it's a list of tuples or Card objects
@@ -1659,11 +1673,26 @@ class SciCamGUI(QWidget):
                             key = str(item[0]).upper()
                             value = item[1]
                             comment = item[2] if len(item) > 2 else ""
+
+                            # Replace None with empty string for FITS compatibility
+                            if value is None:
+                                value = ""
+                                self.print_terminal(
+                                    f"Replacing None value in header {key} with empty string"
+                                )
+
                             hdr[key] = (value, comment)
                     elif hasattr(item, "keyword") and hasattr(item, "value"):
                         # Astropy Card object
+                        value = item.value
+                        if value is None:
+                            value = ""
+                            self.print_terminal(
+                                f"Replacing None value in header {item.keyword} with empty string"
+                            )
+
                         hdr[item.keyword] = (
-                            item.value,
+                            value,
                             item.comment if hasattr(item, "comment") else "",
                         )
 
