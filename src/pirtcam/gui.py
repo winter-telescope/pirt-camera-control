@@ -499,6 +499,30 @@ class SciCamGUI(QWidget):
         self.exp_input.setValue(1.0)
         self.exp_input.blockSignals(False)
 
+        # Query current exposure time from camera and update the display value
+        self.exp_input.blockSignals(True)
+        current_exp_str = self.query_scalar("SENS:EXPPER?")
+        if current_exp_str:
+            try:
+                CLOCK_FREQ = 15.0
+                current_cycles = int(current_exp_str)
+                current_exp_seconds = current_cycles / (CLOCK_FREQ * 1e6)
+                self.exp_input.setValue(current_exp_seconds)
+                self.print_terminal(
+                    f"Current camera exposure: {current_exp_seconds:.6f}s"
+                )
+            except ValueError:
+                self.print_terminal(
+                    f"Could not parse exposure cycles: {current_exp_str}, using default 1.0s"
+                )
+                self.exp_input.setValue(1.0)
+        else:
+            self.print_terminal(
+                "Could not read exposure from camera, using default 1.0s"
+            )
+            self.exp_input.setValue(1.0)
+        self.exp_input.blockSignals(False)
+
         self.state = {}
 
         # Enum to track the camera gui state
@@ -836,6 +860,8 @@ class SciCamGUI(QWidget):
             # TEC is not locked
             self.camera_state = CameraState.TEC_SETTLING
 
+        self.state.update({"camera_state": self.camera_state.name})
+
         # Update the GUI:
         # Update camera state label
         self.camera_state_label.setText(f"State: {self.camera_state.name}")
@@ -891,9 +917,12 @@ class SciCamGUI(QWidget):
 
             # Update progress bar for exposure time
             if self.current_exposure_time > 0:
+                # Calculate elapsed time
+                exposure_elapsed = self.current_exposure_time - exposure_time_remaining
+
                 # Set maximum to exposure time in tenths of seconds for smooth animation
                 max_val = int(self.current_exposure_time * 10)
-                current_val = int(exposure_time_remaining * 10)
+                current_val = int(exposure_elapsed * 10)
                 self.capture_progress.setMaximum(max_val)
                 self.capture_progress.setValue(current_val)
                 self.capture_progress.setFormat(
@@ -983,7 +1012,7 @@ class SciCamGUI(QWidget):
 
         if setpoint:
             try:
-                setpoint = float(setpoint)
+                setpoint = np.round(float(setpoint), 2)
             except Exception:
                 setpoint = -888.0
             self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
@@ -993,7 +1022,7 @@ class SciCamGUI(QWidget):
         temp = self.query_scalar("TEMP:SENS?")
         if temp:
             try:
-                temp = float(temp)
+                temp = np.round(float(temp), 2)
             except Exception:
                 temp = -888.0
             self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
@@ -1067,7 +1096,7 @@ class SciCamGUI(QWidget):
         case_temp = self.query_scalar("TEMP:CASE?")
         if case_temp:
             try:
-                case_temp = float(case_temp)
+                case_temp = np.round(float(case_temp), 2)
             except Exception:
                 case_temp = -888.0
         self.state.update({"case_temp": case_temp})
@@ -1076,7 +1105,7 @@ class SciCamGUI(QWidget):
         digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
         if digpcb_temp:
             try:
-                digpcb_temp = float(digpcb_temp)
+                digpcb_temp = np.round(float(digpcb_temp), 2)
             except Exception:
                 digpcb_temp = -888.0
         self.state.update({"digpcb_temp": digpcb_temp})
@@ -1085,7 +1114,7 @@ class SciCamGUI(QWidget):
         senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
         if senspcb_temp:
             try:
-                senspcb_temp = float(senspcb_temp)
+                senspcb_temp = np.round(float(senspcb_temp), 2)
             except Exception:
                 senspcb_temp = -888.0
         self.state.update({"senspcb_temp": senspcb_temp})
