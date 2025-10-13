@@ -862,6 +862,9 @@ class SciCamGUI(QWidget):
             response = {"status": "error", "message": "Invalid JSON command"}
             if self.command_server:
                 self.command_server.send_response(json.dumps(response))
+            import traceback
+
+            self.print_terminal(f"Error processing command: {traceback.format_exc()}")
         except Exception as e:
             response = {"status": "error", "message": str(e)}
             if self.command_server:
