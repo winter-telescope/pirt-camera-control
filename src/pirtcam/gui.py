@@ -76,6 +76,8 @@ class CommandServer(QThread):
     def handle_client(self, client):
         """Handle individual client connections"""
         self.clients.append(client)
+        buffer = ""  # Buffer to accumulate data
+
         try:
             while self.running:
                 try:
@@ -83,11 +85,27 @@ class CommandServer(QThread):
                     if not data:
                         break
 
-                    # Decode command
-                    command = data.decode("utf-8").strip()
-                    if command:
-                        print(f"Received command: {command}")
-                        self.command_received.emit(command)
+                    # Decode and add to buffer
+                    buffer += data.decode("utf-8")
+
+                    # Process complete messages (newline-delimited)
+                    while True:
+                        # Look for newline delimiter
+                        newline_index = buffer.find("\n")
+                        if newline_index == -1:
+                            # No complete message yet
+                            break
+
+                        # Extract the complete message
+                        command = buffer[:newline_index]
+                        buffer = buffer[newline_index + 1 :]  # Keep remainder in buffer
+
+                        command = command.strip()
+                        if command:
+                            print(
+                                f"Received command: {command[:100]}..."
+                            )  # Print first 100 chars
+                            self.command_received.emit(command)
 
                 except socket.timeout:
                     continue
