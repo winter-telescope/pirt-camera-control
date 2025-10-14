@@ -102,9 +102,18 @@ class CommandServer(QThread):
 
                         command = command.strip()
                         if command:
-                            print(
-                                f"Received command: {command[:100]}..."
-                            )  # Print first 100 chars
+                            # Only print received command if it's not GET_STATUS
+                            try:
+                                cmd_data = json.loads(command)
+                                if cmd_data.get("command", "").upper() != "GET_STATUS":
+                                    print(
+                                        f"Received command: {command[:100]}..."
+                                    )  # Print first 100 chars
+                            except:
+                                # If we can't parse it, print it anyway
+                                print(
+                                    f"Received command: {command[:100]}..."
+                                )  # Print first 100 chars
                             self.command_received.emit(command)
 
                 except socket.timeout:
