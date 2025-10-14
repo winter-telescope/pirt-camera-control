@@ -616,32 +616,41 @@ class SciCamGUI(QWidget):
             response = {"status": "error", "message": "Unknown command"}
 
             if cmd_type == "CAPTURE":
-                # Capture frame(s)
                 nframes = cmd_data.get("nframes", 1)
                 self.nframes_input.setText(str(nframes))
 
-                # Store custom headers and stack mode for capture
                 self.custom_headers = cmd_data.get("headers", {})
                 self.save_as_stack = cmd_data.get("stack", False)
                 self.custom_filename = cmd_data.get("filename", None)
 
-                # Check if TEC is locked
                 if not self.capture_button.isEnabled():
                     response = {"status": "error", "message": "TEC not locked"}
-                else:
-                    # Send immediate response before starting capture
-                    response = {
-                        "status": "success",
-                        "message": f"Starting capture of {nframes} frame(s)",
-                    }
                     if self.command_server:
-                        self.command_server.send_response(json.dumps(response))
+                        self.command_server.send_response(json.dumps(response) + "\n")
+                    return
 
-                    # Trigger capture (notifications will be sent as frames are saved)
-                    self.print_terminal("Starting capture from remote command...")
-                    self.capture_frame()
-                    return  # Don't send response again at the end
+                # Immediate ACK before starting the long/async work
+                ack = {
+                    "status": "success",
+                    "message": f"Starting capture of {nframes} frame(s)",
+                }
+                if self.command_server:
+                    # Log and send with a newline so line-based clients can read a frame
+                    self.print_terminal(
+                        f"Sending response: {ack['status']} - {ack.get('message','')}"
+                    )
+                    try:
+                        self.command_server.send_response(json.dumps(ack) + "\n")
+                    except Exception as e:
+                        self.print_terminal(f"Failed to send ACK: {e}")
+                        return  # don't proceed if we can't talk to the client
 
+                self.print_terminal("Starting capture from remote command...")
+
+                # Defer the actual capture so the socket write can flush
+                QTimer.singleShot(0, self.capture_frame)
+
+                return  # don't fall through to the common send-response block
             elif cmd_type == "SET_EXPOSURE":
                 # Set exposure time
                 exp_time = cmd_data.get("exposure", 1.0)
