@@ -315,158 +315,156 @@ class CameraClient:
             self.current_capture = None
             return response
 
-        if wait_for_completion:
-            # Store debug flag for other methods
-            self._debug = debug
-            self._stack_mode = stack
+        # If not waiting for completion, return the ACK immediately
+        if not wait_for_completion:
+            return response  # ← ADD THIS LINE
 
-            # Clear notification queue before starting
-            while not self.notification_queue.empty():
+        # Wait for all frames to be captured
+        # Store debug flag for other methods
+        self._debug = debug
+        self._stack_mode = stack
+
+        # Clear notification queue before starting
+        while not self.notification_queue.empty():
+            try:
+                self.notification_queue.get_nowait()
+            except Empty:
+                break
+
+        # ... [rest of waiting logic stays the same] ...
+
+        last_update = time.time()
+        no_progress_time = 0
+        last_completed = 0
+        expected_time = (
+            (self.current_capture.exposure_time + 2.0) * nframes if stack else 0
+        )
+
+        if debug:
+            print(f"[DEBUG] Waiting for {nframes} frames to complete...")
+            print(
+                f"[DEBUG] Current capture: {self.current_capture.completed_frames}/{self.current_capture.total_frames}"
+            )
+            if stack:
+                print(
+                    f"[DEBUG] Stack mode: Progress updates will only appear after all frames are captured"
+                )
+                print(f"[DEBUG] Estimated time for stack capture: {expected_time:.1f}s")
+
+        while self.current_capture.completed_frames < nframes:
+            # Process all pending notifications
+            notifications_processed = 0
+            while True:
                 try:
-                    self.notification_queue.get_nowait()
+                    notif = self.notification_queue.get_nowait()
+                    if debug:
+                        print(f"[DEBUG] Got notification: {notif}")
+                    # Process notification manually if needed
+                    if notif.get("event") in ["frame_saved", "stack_saved"]:
+                        # The _receive_loop should have already called _update_capture_progress
+                        # but let's make sure
+                        if self.current_capture.completed_frames < nframes:
+                            self._update_capture_progress(notif)
+                    notifications_processed += 1
                 except Empty:
                     break
 
-            # Wait for all frames to be captured
-            last_update = time.time()
-            no_progress_time = 0
-            last_completed = 0
-            expected_time = (
-                (self.current_capture.exposure_time + 2.0) * nframes if stack else 0
+            # Show progress every second if enabled
+            current_time = time.time()
+            if show_progress and current_time - last_update > 1.0:
+                if (
+                    not debug and not stack
+                ):  # Don't show progress bar in debug mode or stack mode
+                    self._print_progress()
+                elif stack and not debug:
+                    # For stack mode, show elapsed time instead of frame progress
+                    elapsed = self.current_capture.elapsed_time
+                    print(
+                        f"\rCapturing stack: {elapsed:.1f}s elapsed...",
+                        end="",
+                        flush=True,
+                    )
+                last_update = current_time
+
+            # Check for stalled progress
+            if self.current_capture.completed_frames == last_completed:
+                no_progress_time += 0.1
+                if debug and no_progress_time > 5 and int(no_progress_time) % 5 == 0:
+                    print(
+                        f"[DEBUG] No progress for {int(no_progress_time)}s. "
+                        f"Completed: {self.current_capture.completed_frames}/{nframes}"
+                    )
+                    if stack and no_progress_time < expected_time:
+                        print(
+                            f"[DEBUG] This is normal for stack mode - waiting for all frames to complete"
+                        )
+            else:
+                no_progress_time = 0
+                last_completed = self.current_capture.completed_frames
+                if debug:
+                    print(
+                        f"[DEBUG] Progress: {self.current_capture.completed_frames}/{nframes} frames completed"
+                    )
+
+            # Timeout if no progress for 30 seconds (but longer for stacks)
+            timeout_threshold = max(300, expected_time * 1.5) if stack else 30
+            if no_progress_time > timeout_threshold:
+                print(
+                    f"\nWARNING: No progress for {int(no_progress_time)}s. Completed {self.current_capture.completed_frames}/{nframes} frames"
+                )
+                if debug:
+                    print(
+                        f"[DEBUG] Breaking due to no progress timeout (threshold: {timeout_threshold}s)"
+                    )
+                    print(f"[DEBUG] Final state: {self.current_capture.to_dict()}")
+                # break # Uncomment to break on timeout
+
+            # Check for overall timeout (5 minutes per frame max, or expected time * 2 for stacks)
+            overall_timeout = (
+                max(nframes * 300, expected_time * 2) if stack else nframes * 300
             )
-
-            if debug:
-                print(f"[DEBUG] Waiting for {nframes} frames to complete...")
-                print(
-                    f"[DEBUG] Current capture: {self.current_capture.completed_frames}/{self.current_capture.total_frames}"
-                )
-                if stack:
+            if self.current_capture.elapsed_time > overall_timeout:
+                print("\nERROR: Overall capture timeout exceeded!")
+                if debug:
+                    print(f"[DEBUG] Breaking due to overall timeout")
                     print(
-                        f"[DEBUG] Stack mode: Progress updates will only appear after all frames are captured"
+                        f"[DEBUG] Elapsed time: {self.current_capture.elapsed_time}s (timeout: {overall_timeout}s)"
                     )
-                    print(
-                        f"[DEBUG] Estimated time for stack capture: {expected_time:.1f}s"
-                    )
+                # break # Uncomment to break on timeout
 
-            while self.current_capture.completed_frames < nframes:
-                # Process all pending notifications
-                notifications_processed = 0
-                while True:
-                    try:
-                        notif = self.notification_queue.get_nowait()
-                        if debug:
-                            print(f"[DEBUG] Got notification: {notif}")
-                        # Process notification manually if needed
-                        if notif.get("event") in ["frame_saved", "stack_saved"]:
-                            # The _receive_loop should have already called _update_capture_progress
-                            # but let's make sure
-                            if self.current_capture.completed_frames < nframes:
-                                self._update_capture_progress(notif)
-                        notifications_processed += 1
-                    except Empty:
-                        break
+            # Small sleep to prevent CPU spinning
+            time.sleep(0.1)
 
-                # Show progress every second if enabled
-                current_time = time.time()
-                if show_progress and current_time - last_update > 1.0:
-                    if (
-                        not debug and not stack
-                    ):  # Don't show progress bar in debug mode or stack mode
-                        self._print_progress()
-                    elif stack and not debug:
-                        # For stack mode, show elapsed time instead of frame progress
-                        elapsed = self.current_capture.elapsed_time
-                        print(
-                            f"\rCapturing stack: {elapsed:.1f}s elapsed...",
-                            end="",
-                            flush=True,
-                        )
-                    last_update = current_time
+        # Final status
+        if debug:
+            print(
+                f"[DEBUG] Capture loop ended. Final count: {self.current_capture.completed_frames}/{nframes}"
+            )
+            print(f"[DEBUG] Filenames captured: {len(self.current_capture.filenames)}")
 
-                # Check for stalled progress
-                if self.current_capture.completed_frames == last_completed:
-                    no_progress_time += 0.1
-                    if (
-                        debug
-                        and no_progress_time > 5
-                        and int(no_progress_time) % 5 == 0
-                    ):
-                        print(
-                            f"[DEBUG] No progress for {int(no_progress_time)}s. "
-                            f"Completed: {self.current_capture.completed_frames}/{nframes}"
-                        )
-                        if stack and no_progress_time < expected_time:
-                            print(
-                                f"[DEBUG] This is normal for stack mode - waiting for all frames to complete"
-                            )
-                else:
-                    no_progress_time = 0
-                    last_completed = self.current_capture.completed_frames
-                    if debug:
-                        print(
-                            f"[DEBUG] Progress: {self.current_capture.completed_frames}/{nframes} frames completed"
-                        )
+        # Final progress update
+        if show_progress and not debug:
+            self._print_progress()
+            print()  # New line after progress
 
-                # Timeout if no progress for 30 seconds (but longer for stacks)
+        # Clean up debug flag
+        self._debug = False
+        self._stack_mode = False
 
-                timeout_threshold = max(300, expected_time * 1.5) if stack else 30
-                if no_progress_time > timeout_threshold:
-                    print(
-                        f"\nWARNING: No progress for {int(no_progress_time)}s. Completed {self.current_capture.completed_frames}/{nframes} frames"
-                    )
-                    if debug:
-                        print(
-                            f"[DEBUG] Breaking due to no progress timeout (threshold: {timeout_threshold}s)"
-                        )
-                        print(f"[DEBUG] Final state: {self.current_capture.to_dict()}")
-                    # break # Uncomment to break on timeout
+        # Save to history
+        self.capture_history.append(self.current_capture)
 
-                # Check for overall timeout (5 minutes per frame max, or expected time * 2 for stacks)
-                overall_timeout = (
-                    max(nframes * 300, expected_time * 2) if stack else nframes * 300
-                )
-                if self.current_capture.elapsed_time > overall_timeout:
-                    print("\nERROR: Overall capture timeout exceeded!")
-                    if debug:
-                        print(f"[DEBUG] Breaking due to overall timeout")
-                        print(
-                            f"[DEBUG] Elapsed time: {self.current_capture.elapsed_time}s (timeout: {overall_timeout}s)"
-                        )
-                    # break # Uncomment to break on timeout
+        # Return results
+        result = {
+            "status": "success",
+            "frames_captured": self.current_capture.completed_frames,
+            "filenames": self.current_capture.filenames,
+            "elapsed_time": self.current_capture.elapsed_time,
+            "average_frame_time": self.current_capture.average_frame_time,
+            "stack_mode": stack,
+        }
 
-                # Small sleep to prevent CPU spinning
-                time.sleep(0.1)
-
-            # Final status
-            if debug:
-                print(
-                    f"[DEBUG] Capture loop ended. Final count: {self.current_capture.completed_frames}/{nframes}"
-                )
-                print(
-                    f"[DEBUG] Filenames captured: {len(self.current_capture.filenames)}"
-                )
-
-            # Final progress update
-            if show_progress and not debug:
-                self._print_progress()
-                print()  # New line after progress
-
-            # Clean up debug flag
-            self._debug = False
-            self._stack_mode = False
-
-            # Save to history
-            self.capture_history.append(self.current_capture)
-
-            # Return results
-            result = {
-                "status": "success",
-                "frames_captured": self.current_capture.completed_frames,
-                "filenames": self.current_capture.filenames,
-                "elapsed_time": self.current_capture.elapsed_time,
-                "average_frame_time": self.current_capture.average_frame_time,
-                "stack_mode": stack,
-            }
+        return result
 
     def capture_frames_jupyter(
         self, nframes=1, headers=None, stack=False, filename=None
