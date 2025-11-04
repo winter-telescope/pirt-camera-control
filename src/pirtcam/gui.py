@@ -1305,6 +1305,10 @@ class SciCamGUI(QWidget):
     def prepare_one_shot(self):
         """Prime camera for exactly one triggered exposure (do NOT start it)."""
         self.setup_serial()
+
+        # query the current trigger mode
+        self.trigger_mode = self.query_scalar("SENS:TRIG:MODE?")
+        self.print_terminal(f"Current trigger mode: {self.trigger_mode}")
         try:
             # Ensure we won't free-run and we only accept one trigger
             self.send_command("SENS:TRIG OFF")
