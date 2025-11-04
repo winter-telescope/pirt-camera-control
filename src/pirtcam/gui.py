@@ -278,9 +278,12 @@ class CaptureThread(QThread):
 
                 # Capture logic
                 if self.trigmode is TrigMode.SINGLE:
-                    self.parent.arm_one_shot_trigger()
                     CirAq = None
                     try:
+                        # 1) Prime camera for exactly one shot (no exposure yet)
+                        self.parent.prepare_one_shot()
+
+                        # 2) Bring up acquisition first so DMA is ready before we trigger
                         CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                         CirAq.Open(0)
                         numbuffers = 3
@@ -290,30 +293,40 @@ class CaptureThread(QThread):
                             Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
                         )
 
-                        framearr = False
-                        t0 = time.time()
-                        self.parent.print_terminal(
-                            f"Starting recording {i+1}/{self.nframes} .."
-                        )
+                        # 3) Trigger barrier: remember the current SENT count
+                        sent0 = self.parent.query_trigger_sent()
+                        sent0 = -1 if sent0 is None else int(sent0)
 
-                        while not framearr:
+                        # 4) Fire NOW and start timing at the same instant
+                        self.parent.fire_one_shot()
+                        t0 = time.time()
+
+                        # (Optional) If you don’t fully trust soft-trigger semantics, you can
+                        # loop until SENT increments before proceeding to wait:
+                        # while True:
+                        #     cur = self.parent.query_trigger_sent()
+                        #     if cur is not None and int(cur) > sent0:
+                        #         break
+                        #     time.sleep(0.001)
+
+                        # 5) Wait for the frame that exposure will produce
+                        while True:
                             try:
-                                curBuf = CirAq.WaitForFrame(5000)
+                                curBuf = CirAq.WaitForFrame(
+                                    int(
+                                        (self.parent.current_exposure_time + 5.0) * 1000
+                                    )
+                                )
+                                bufnum = curBuf.BufferNumber
+                                t1 = time.time()
+                                break
                             except Buf.PythonMemException:
-                                self.parent.print_terminal("Waiting for frame arrival")
-                                # teardown before re-arming
+                                self.parent.print_terminal(
+                                    "WaitForFrame retry (rebuilt buffers)"
+                                )
                                 CirAq.AqCleanup()
                                 CirAq.BufferCleanup()
                                 CirAq.Close()
-
-                                cur_sent = self.parent.query_trigger_sent()
-                                if cur_sent == 1:
-                                    self.parent.print_terminal(
-                                        "Missed a buffer, reinitializing TRIG"
-                                    )
-                                    self.parent.arm_one_shot_trigger()  # re-arm
-
-                                # rebuild acquisition
                                 CirAq = Buf.clsCircularAcquisition(
                                     Buf.ErrorMode.ErIgnore
                                 )
@@ -324,18 +337,16 @@ class CaptureThread(QThread):
                                     Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
                                 )
                                 continue
-                            else:
-                                framearr = True
-                                bufnum = curBuf.BufferNumber
-                                t1 = time.time()
 
                         total_time = t1 - t0
                         self.parent.print_terminal(
-                            f"Total acquisition time: {total_time:.2f} seconds"
+                            f"Total acquisition time (trigger→buffer): {total_time:.3f} s"
                         )
+
                         img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
+
                     finally:
-                        # ALWAYS disarm + cleanup even on exceptions
+                        # 6) Safety disarm + cleanup
                         try:
                             self.parent.disarm_trigger()
                         except Exception:
@@ -1291,18 +1302,28 @@ class SciCamGUI(QWidget):
         time.sleep(0.2)
 
     # serial helpers
-    def arm_one_shot_trigger(self):
-        """Arm the camera to send exactly one frame on trigger."""
+    def prepare_one_shot(self):
+        """Prime camera for exactly one triggered exposure (do NOT start it)."""
         self.setup_serial()
         try:
+            # Ensure we won't free-run and we only accept one trigger
             self.send_command("SENS:TRIG OFF")
+            # tiny settle so the next write isn't coalesced on the device side
+            time.sleep(0.01)
             self.send_command("SENS:TRIG:COUNT 1")
+        finally:
+            self.CL.SerialClose()
+
+    def fire_one_shot(self):
+        """Start the exposure now (soft-trigger-on semantics)."""
+        self.setup_serial()
+        try:
             self.send_command("SENS:TRIG ON")
         finally:
             self.CL.SerialClose()
 
     def disarm_trigger(self):
-        """Turn trigger off (safety after a frame or on error)."""
+        """Ensure trigger is off after a shot or on error."""
         self.setup_serial()
         try:
             self.send_command("SENS:TRIG OFF")
