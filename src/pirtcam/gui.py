@@ -321,7 +321,7 @@ class CaptureThread(QThread):
                             t1 = time.time()
 
                     total_time = t1 - t0
-                    self.print_terminal(
+                    self.parent.print_terminal(
                         f"Total acquisition time: {total_time:.2f} seconds"
                     )
                 else:
