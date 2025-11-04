@@ -1804,12 +1804,15 @@ if __name__ == "__main__":
     print(f"gui.py: Parsing sys.argv...")
     print(f"gui.py: arguments = {arguments}")
     print(f"gui.py: values = {values}")
+
+    # Set Defaults:
+    trigmode = "SINGLE"
+
+    # Process Arguments
     for currentArgument, currentValue in arguments:
         if currentArgument in ("--trigmode"):
             trigmode = currentValue
             print(f"gui.py: Setting trigmode to {trigmode}")
-        else:
-            trigmode = "SINGLE"
 
     app = QApplication(sys.argv)
     viewer = ImageViewer()
