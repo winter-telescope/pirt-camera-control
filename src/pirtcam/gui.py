@@ -37,6 +37,11 @@ from PyQt5.QtWidgets import (
 )
 
 
+class TrigMode(str, Enum):
+    SINGLE = "SINGLE"
+    STREAM = "STREAM"
+
+
 class CommandServer(QThread):
     """TCP/IP server running in separate thread to handle remote commands"""
 
@@ -227,7 +232,7 @@ class CaptureThread(QThread):
     image_ready = pyqtSignal(np.ndarray)
     notification = pyqtSignal(dict)
 
-    def __init__(self, parent=None, trigmode="SINGLE"):
+    def __init__(self, parent=None, trigmode: TrigMode = TrigMode.SINGLE):
         super().__init__(parent)
         self.parent = parent
         self.nframes = 1
@@ -272,20 +277,91 @@ class CaptureThread(QThread):
                 self.frame_captured.emit(i + 1, self.nframes)
 
                 # Capture logic
-                CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
-                CirAq.Open(0)
-                numbuffers = 2
-                BufArr = CirAq.BufferSetup(numbuffers)
-                CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
+                if self.trigmode is TrigMode.SINGLE:
+                    self.parent.arm_one_shot_trigger()
+                    CirAq = None
+                    try:
+                        CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                        CirAq.Open(0)
+                        numbuffers = 3
+                        BufArr = CirAq.BufferSetup(numbuffers)
+                        CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                        CirAq.AqControl(
+                            Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                        )
 
-                framearr = False
-                t0 = time.time()
-                self.parent.print_terminal(
-                    f"Starting recording {i+1}/{self.nframes} .."
-                )
-                if self.trigmode.upper() == "SINGLE":
-                    # handle single trigger mode: stop the trigger after each exposure
+                        framearr = False
+                        t0 = time.time()
+                        self.parent.print_terminal(
+                            f"Starting recording {i+1}/{self.nframes} .."
+                        )
+
+                        while not framearr:
+                            try:
+                                curBuf = CirAq.WaitForFrame(5000)
+                            except Buf.PythonMemException:
+                                self.parent.print_terminal("Waiting for frame arrival")
+                                # teardown before re-arming
+                                CirAq.AqCleanup()
+                                CirAq.BufferCleanup()
+                                CirAq.Close()
+
+                                cur_sent = self.parent.query_trigger_sent()
+                                if cur_sent == 1:
+                                    self.parent.print_terminal(
+                                        "Missed a buffer, reinitializing TRIG"
+                                    )
+                                    self.parent.arm_one_shot_trigger()  # re-arm
+
+                                # rebuild acquisition
+                                CirAq = Buf.clsCircularAcquisition(
+                                    Buf.ErrorMode.ErIgnore
+                                )
+                                CirAq.Open(0)
+                                BufArr = CirAq.BufferSetup(numbuffers)
+                                CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                                CirAq.AqControl(
+                                    Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                                )
+                                continue
+                            else:
+                                framearr = True
+                                bufnum = curBuf.BufferNumber
+                                t1 = time.time()
+
+                        total_time = t1 - t0
+                        self.parent.print_terminal(
+                            f"Total acquisition time: {total_time:.2f} seconds"
+                        )
+                        img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
+                    finally:
+                        # ALWAYS disarm + cleanup even on exceptions
+                        try:
+                            self.parent.disarm_trigger()
+                        except Exception:
+                            pass
+                        if CirAq is not None:
+                            try:
+                                CirAq.AqCleanup()
+                                CirAq.BufferCleanup()
+                                CirAq.Close()
+                            except Exception:
+                                pass
+
+                else:
+                    CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                    CirAq.Open(0)
+                    numbuffers = 3
+                    BufArr = CirAq.BufferSetup(numbuffers)
+                    CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                    CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
+
+                    framearr = False
+                    t0 = time.time()
+                    self.parent.print_terminal(
+                        f"Starting recording {i+1}/{self.nframes} .."
+                    )
+
                     while not framearr:
                         try:
                             curBuf = CirAq.WaitForFrame(5000)
@@ -295,45 +371,6 @@ class CaptureThread(QThread):
                             CirAq.BufferCleanup()
                             CirAq.Close()
 
-                            self.parent.setup_serial()
-                            cur_sent = int(self.parent.query_scalar("SENS:TRIG:SENT?"))
-                            if cur_sent == 1:
-                                self.parent.print_terminal(
-                                    "Missed a buffer, reinitalizing TRIG"
-                                )
-                                self.parent.send_command("SENS:TRIG OFF")
-                                # time.sleep(2)
-                                self.parent.send_command("SENS:TRIG:COUNT 1")
-                                self.parent.send_command("SENS:TRIG ON")
-                            self.parent.CL.SerialClose()
-
-                            CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
-                            CirAq.Open(0)
-                            BufArr = CirAq.BufferSetup(numbuffers)
-                            CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                            CirAq.AqControl(
-                                Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
-                            )
-                            continue
-                        else:
-                            framearr = True
-                            bufnum = curBuf.BufferNumber
-                            t1 = time.time()
-
-                    total_time = t1 - t0
-                    self.parent.print_terminal(
-                        f"Total acquisition time: {total_time:.2f} seconds"
-                    )
-                else:
-                    while not framearr:
-                        try:
-                            curBuf = CirAq.WaitForFrame(1000)
-                        except Buf.PythonMemException:
-                            self.parent.print_terminal("Waiting for frame arrival")
-                            CirAq.AqCleanup()
-                            CirAq.BufferCleanup()
-                            CirAq.Close()
-
                             CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                             CirAq.Open(0)
                             BufArr = CirAq.BufferSetup(numbuffers)
@@ -352,10 +389,10 @@ class CaptureThread(QThread):
                         f"Total acquisition time: {total_time:.2f} seconds"
                     )
 
-                img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
-                CirAq.AqCleanup()
-                CirAq.BufferCleanup()
-                CirAq.Close()
+                    img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
+                    CirAq.AqCleanup()
+                    CirAq.BufferCleanup()
+                    CirAq.Close()
 
                 # Create FITS header and save
                 now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -374,6 +411,8 @@ class CaptureThread(QThread):
                     hdr["OBJECT"] = (object_name, "Object name")
                 if observer_name:
                     hdr["OBSERVER"] = (observer_name, "Observer name")
+
+                hdr["TRIGMODE"] = (self.trigmode.value, "Acquisition trigger mode")
 
                 # Query camera parameters
                 CLOCK_FREQ_MHZ = 15.0
@@ -559,7 +598,9 @@ class CameraState(Enum):
 class SciCamGUI(QWidget):
     waiting_on_exposure_update = False
 
-    def __init__(self, enable_server=True, server_port=5555, trigmode="SINGLE"):
+    def __init__(
+        self, enable_server=True, server_port=5555, trigmode: TrigMode = TrigMode.SINGLE
+    ):
         super().__init__()
         self.trigmode = trigmode
         self.setWindowTitle("PIRT Control Panel")
@@ -873,6 +914,7 @@ class SciCamGUI(QWidget):
                         "capture_time_remaining", 0.0
                     ),
                     "camera_state": self.camera_state.name,
+                    "trigmode": self.trigmode.value,
                 }
                 response = {"status": "success", "data": status}
 
@@ -1247,6 +1289,37 @@ class SciCamGUI(QWidget):
         self.CL.SerialInit(0)
         self.CL.SetBaudRate(CLCom.BaudRates.CLBaudRate115200)
         time.sleep(0.2)
+
+    # serial helpers
+    def arm_one_shot_trigger(self):
+        """Arm the camera to send exactly one frame on trigger."""
+        self.setup_serial()
+        try:
+            self.send_command("SENS:TRIG OFF")
+            self.send_command("SENS:TRIG:COUNT 1")
+            self.send_command("SENS:TRIG ON")
+        finally:
+            self.CL.SerialClose()
+
+    def disarm_trigger(self):
+        """Turn trigger off (safety after a frame or on error)."""
+        self.setup_serial()
+        try:
+            self.send_command("SENS:TRIG OFF")
+        finally:
+            self.CL.SerialClose()
+
+    def query_trigger_sent(self) -> int | None:
+        """Return 1 if a trigger was sent/consumed, else 0/None."""
+        self.setup_serial()
+        try:
+            val = self.query_scalar("SENS:TRIG:SENT?")
+            if val is not None:
+                s = str(val).strip()
+                return int(s) if s.isdigit() else None
+            return None
+        finally:
+            self.CL.SerialClose()
 
     def setup_ui(self):
         layout = QVBoxLayout()
@@ -1796,23 +1869,34 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     print(f"wsp.py: args = {args}")
 
-    options = "rimvn:s"
+    options = "t:"
     long_options = ["trigmode"]
-    arguments, values = getopt.getopt(args, options, long_options)
-    # checking each argument
-    print()
-    print(f"gui.py: Parsing sys.argv...")
-    print(f"gui.py: arguments = {arguments}")
-    print(f"gui.py: values = {values}")
 
-    # Set Defaults:
-    trigmode = "SINGLE"
+    trigmode = TrigMode.SINGLE  # default
 
-    # Process Arguments
-    for currentArgument, currentValue in arguments:
-        if currentArgument in ("--trigmode"):
-            trigmode = currentValue
-            print(f"gui.py: Setting trigmode to {trigmode}")
+    try:
+        # short "-t MODE", long "--trigmode=MODE"
+        opts, values = getopt.getopt(args, options, long_options)
+        # checking each argument
+        print()
+        print(f"gui.py: Parsing sys.argv...")
+        print(f"gui.py: opts = {opts}")
+        print(f"gui.py: values = {values}")
+    except getopt.GetoptError as e:
+        print(f"Argument error: {e}")
+        sys.exit(2)
+
+    for opt, val in opts:
+        if opt in ("-t", "--trigmode"):
+            val = str(val).strip().upper()
+            trigmode = TrigMode[val] if val in TrigMode.__members__ else TrigMode.STREAM
+
+    # validate
+    if trigmode not in (TrigMode.SINGLE, TrigMode.STREAM):
+        print(f"Unknown trigmode '{trigmode}', falling back to STREAM")
+        trigmode = TrigMode.STREAM
+
+    print(f"gui.py: trigmode = {trigmode}")
 
     app = QApplication(sys.argv)
     viewer = ImageViewer()
