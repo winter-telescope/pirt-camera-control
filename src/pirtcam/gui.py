@@ -352,7 +352,10 @@ class CaptureThread(QThread):
                                             f"Camera exposure completed; waiting for DMA/frame..."
                                         )
                                         # If the camera finished, extend the deadline once to give the grabber breathing room.
-                                        base_deadline = max(base_deadline, now + 8.0)
+                                        base_deadline = max(
+                                            base_deadline, now + 3.0 * exp_s
+                                        )
+
                                 except Exception as e:
                                     self.parent.print_terminal(
                                         f"[single] SENT mid-wait check failed: {e}"
