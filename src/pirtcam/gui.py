@@ -5,6 +5,7 @@ import sys
 os.add_dll_directory(r"C:\BitFlow SDK 6.5\Bin64")
 os.add_dll_directory(r"C:\Program Files\CameraLink\Serial")
 
+import getopt
 import json
 import socket
 import threading
@@ -226,12 +227,13 @@ class CaptureThread(QThread):
     image_ready = pyqtSignal(np.ndarray)
     notification = pyqtSignal(dict)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, trigmode="SINGLE"):
         super().__init__(parent)
         self.parent = parent
         self.nframes = 1
         self.save_as_stack = False
         self.custom_headers = {}
+        self.trigmode = trigmode
         self.custom_filename = None
 
     def setup_capture(
@@ -282,33 +284,73 @@ class CaptureThread(QThread):
                 self.parent.print_terminal(
                     f"Starting recording {i+1}/{self.nframes} .."
                 )
+                if self.trigmode.upper() == "SINGLE":
+                    # handle single trigger mode: stop the trigger after each exposure
+                    while not framearr:
+                        try:
+                            curBuf = CirAq.WaitForFrame(5000)
+                        except Buf.PythonMemException:
+                            self.print_terminal("Waiting for frame arrival")
+                            CirAq.AqCleanup()
+                            CirAq.BufferCleanup()
+                            CirAq.Close()
 
-                while not framearr:
-                    try:
-                        curBuf = CirAq.WaitForFrame(1000)
-                    except Buf.PythonMemException:
-                        self.parent.print_terminal("Waiting for frame arrival")
-                        CirAq.AqCleanup()
-                        CirAq.BufferCleanup()
-                        CirAq.Close()
+                            self.setup_serial()
+                            cur_sent = int(self.query_scalar("SENS:TRIG:SENT?"))
+                            if cur_sent == 1:
+                                self.print_terminal(
+                                    "Missed a buffer, reinitalizing TRIG"
+                                )
+                                self.send_command("SENS:TRIG OFF")
+                                # time.sleep(2)
+                                self.send_command("SENS:TRIG:COUNT 1")
+                                self.send_command("SENS:TRIG ON")
+                            self.CL.SerialClose()
 
-                        CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
-                        CirAq.Open(0)
-                        BufArr = CirAq.BufferSetup(numbuffers)
-                        CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                        CirAq.AqControl(
-                            Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
-                        )
-                        continue
-                    else:
-                        framearr = True
-                        bufnum = curBuf.BufferNumber
-                        t1 = time.time()
+                            CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                            CirAq.Open(0)
+                            BufArr = CirAq.BufferSetup(numbuffers)
+                            CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                            CirAq.AqControl(
+                                Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                            )
+                            continue
+                        else:
+                            framearr = True
+                            bufnum = curBuf.BufferNumber
+                            t1 = time.time()
 
-                total_time = t1 - t0
-                self.parent.print_terminal(
-                    f"Total acquisition time: {total_time:.2f} seconds"
-                )
+                    total_time = t1 - t0
+                    self.print_terminal(
+                        f"Total acquisition time: {total_time:.2f} seconds"
+                    )
+                else:
+                    while not framearr:
+                        try:
+                            curBuf = CirAq.WaitForFrame(1000)
+                        except Buf.PythonMemException:
+                            self.parent.print_terminal("Waiting for frame arrival")
+                            CirAq.AqCleanup()
+                            CirAq.BufferCleanup()
+                            CirAq.Close()
+
+                            CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                            CirAq.Open(0)
+                            BufArr = CirAq.BufferSetup(numbuffers)
+                            CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                            CirAq.AqControl(
+                                Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                            )
+                            continue
+                        else:
+                            framearr = True
+                            bufnum = curBuf.BufferNumber
+                            t1 = time.time()
+
+                    total_time = t1 - t0
+                    self.parent.print_terminal(
+                        f"Total acquisition time: {total_time:.2f} seconds"
+                    )
 
                 img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
                 CirAq.AqCleanup()
@@ -517,8 +559,9 @@ class CameraState(Enum):
 class SciCamGUI(QWidget):
     waiting_on_exposure_update = False
 
-    def __init__(self, enable_server=True, server_port=5555):
+    def __init__(self, enable_server=True, server_port=5555, trigmode="SINGLE"):
         super().__init__()
+        self.trigmode = trigmode
         self.setWindowTitle("PIRT Control Panel")
         self.setGeometry(100, 100, 600, 550)  # Slightly taller for progress bar
         self.setup_ui()
@@ -566,7 +609,7 @@ class SciCamGUI(QWidget):
         self.current_exposure_time = 0.0
 
         # Initialize capture thread
-        self.capture_thread = CaptureThread(self)
+        self.capture_thread = CaptureThread(self, trigmode=self.trigmode)
         self.capture_thread.status_update.connect(self.on_capture_status_update)
         self.capture_thread.frame_captured.connect(self.on_frame_captured)
         self.capture_thread.capture_complete.connect(self.on_capture_complete)
@@ -1748,13 +1791,33 @@ class SciCamGUI(QWidget):
 
 
 if __name__ == "__main__":
+
+    # GET ANY COMMAND LINE ARGUMENTS
+    args = sys.argv[1:]
+    print(f"wsp.py: args = {args}")
+
+    options = "rimvn:s"
+    long_options = ["trigmode"]
+    arguments, values = getopt.getopt(args, options, long_options)
+    # checking each argument
+    print()
+    print(f"gui.py: Parsing sys.argv...")
+    print(f"gui.py: arguments = {arguments}")
+    print(f"gui.py: values = {values}")
+    for currentArgument, currentValue in arguments:
+        if currentArgument in ("--trigmode"):
+            trigmode = currentValue
+            print(f"gui.py: Setting trigmode to {trigmode}")
+        else:
+            trigmode = "SINGLE"
+
     app = QApplication(sys.argv)
     viewer = ImageViewer()
     viewer.show()
 
     # You can disable the server by setting enable_server=False
     # or change the port with server_port=XXXX
-    window = SciCamGUI(enable_server=True, server_port=5555)
+    window = SciCamGUI(enable_server=True, server_port=5555, trigmode=trigmode)
     window.viewer = viewer
     window.show()
     sys.exit(app.exec_())
