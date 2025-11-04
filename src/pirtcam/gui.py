@@ -290,22 +290,22 @@ class CaptureThread(QThread):
                         try:
                             curBuf = CirAq.WaitForFrame(5000)
                         except Buf.PythonMemException:
-                            self.print_terminal("Waiting for frame arrival")
+                            self.parent.print_terminal("Waiting for frame arrival")
                             CirAq.AqCleanup()
                             CirAq.BufferCleanup()
                             CirAq.Close()
 
-                            self.setup_serial()
-                            cur_sent = int(self.query_scalar("SENS:TRIG:SENT?"))
+                            self.parent.setup_serial()
+                            cur_sent = int(self.parent.query_scalar("SENS:TRIG:SENT?"))
                             if cur_sent == 1:
-                                self.print_terminal(
+                                self.parent.print_terminal(
                                     "Missed a buffer, reinitalizing TRIG"
                                 )
-                                self.send_command("SENS:TRIG OFF")
+                                self.parent.send_command("SENS:TRIG OFF")
                                 # time.sleep(2)
-                                self.send_command("SENS:TRIG:COUNT 1")
-                                self.send_command("SENS:TRIG ON")
-                            self.CL.SerialClose()
+                                self.parent.send_command("SENS:TRIG:COUNT 1")
+                                self.parent.send_command("SENS:TRIG ON")
+                            self.parent.CL.SerialClose()
 
                             CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                             CirAq.Open(0)
