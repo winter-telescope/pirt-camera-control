@@ -285,7 +285,9 @@ class CaptureThread(QThread):
                         self.parent.setup_serial()
                         try:
                             trig_mode = self.parent.query_scalar("SENS:TRIG:MODE?")
-                            self.parent.print_terminal(f"Camera reports trigger mode: {trig_mode}")
+                            self.parent.print_terminal(
+                                f"Camera reports trigger mode: {trig_mode}"
+                            )
                         finally:
                             self.parent.CL.SerialClose()
 
@@ -303,14 +305,18 @@ class CaptureThread(QThread):
                         numbuffers = 3
                         BufArr = CirAq.BufferSetup(numbuffers)
                         CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                        CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
+                        CirAq.AqControl(
+                            Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                        )
 
                         # 3) Enable trigger gate (ON does not fire on your unit)
                         self.parent.setup_serial()
                         try:
                             self.parent.send_command("SENS:TRIG ON")
                             sent0 = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(f"SENT after TRIG ON (should be 0): {sent0}")
+                            self.parent.print_terminal(
+                                f"SENT after TRIG ON (should be 0): {sent0}"
+                            )
                         finally:
                             self.parent.CL.SerialClose()
 
@@ -321,7 +327,9 @@ class CaptureThread(QThread):
                             # Give device a beat to update counter
                             time.sleep(0.02)
                             sent1 = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(f"SENT after COUNT 1 (should be 1): {sent1}")
+                            self.parent.print_terminal(
+                                f"SENT after COUNT 1 (should be 1): {sent1}"
+                            )
                             if sent1 is None or int(sent1) < 1:
                                 raise RuntimeError(
                                     f"Camera did not consume trigger (SENT={sent1}); "
@@ -361,7 +369,9 @@ class CaptureThread(QThread):
                                     got_frame = True
                                     break
                                 except Buf.PythonMemException:
-                                    raise TimeoutError("No frame received after exposure + slack.")
+                                    raise TimeoutError(
+                                        "No frame received after exposure + slack."
+                                    )
 
                         total_time = t1 - t0
                         self.parent.print_terminal(
@@ -380,12 +390,13 @@ class CaptureThread(QThread):
                                 self.parent.CL.SerialClose()
                         except Exception:
                             pass
-        if CirAq is not None:
-            try:
-                CirAq.AqCleanup(); CirAq.BufferCleanup(); CirAq.Close()
-            except Exception:
-                pass
-
+                        if CirAq is not None:
+                            try:
+                                CirAq.AqCleanup()
+                                CirAq.BufferCleanup()
+                                CirAq.Close()
+                            except Exception:
+                                pass
 
                 else:
                     CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
