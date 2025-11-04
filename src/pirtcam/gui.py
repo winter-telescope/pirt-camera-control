@@ -277,67 +277,70 @@ class CaptureThread(QThread):
                 self.frame_captured.emit(i + 1, self.nframes)
 
                 # Capture logic
-                # --- SINGLE mode: INT source, COUNT 1 + TRIG ON fires one exposure ---
+                # --- SINGLE mode: INT source; TRIG ON enables, COUNT 1 fires one shot ---
                 if self.trigmode is TrigMode.SINGLE:
                     CirAq = None
                     try:
-                        # 0) Prime (do NOT start exposure yet)
+                        # 0) Query and log trigger mode (for sanity)
                         self.parent.setup_serial()
                         try:
-                            self.parent.print_terminal("Current trigger mode: INT")
-                            self.parent.send_command("SENS:TRIG OFF")
-                            time.sleep(0.01)
-                            self.parent.send_command("SENS:TRIG:COUNT 1")
-                            # Read baseline SENT (should be 0 now per docs)
-                            sent_before = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(
-                                f"SENT before TRIG ON: {sent_before}"
-                            )
+                            trig_mode = self.parent.query_scalar("SENS:TRIG:MODE?")
+                            self.parent.print_terminal(f"Camera reports trigger mode: {trig_mode}")
                         finally:
                             self.parent.CL.SerialClose()
 
-                        # 1) Bring up acquisition BEFORE firing so DMA is ready
+                        # 1) Ensure trigger is OFF (reset state)
+                        self.parent.setup_serial()
+                        try:
+                            self.parent.send_command("SENS:TRIG OFF")
+                        finally:
+                            self.parent.CL.SerialClose()
+                        time.sleep(0.01)
+
+                        # 2) Start acquisition BEFORE firing so DMA is ready
                         CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                         CirAq.Open(0)
                         numbuffers = 3
                         BufArr = CirAq.BufferSetup(numbuffers)
                         CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                        CirAq.AqControl(
-                            Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
-                        )
+                        CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
 
-                        # 2) Fire now (INT: TRIG ON consumes COUNT immediately)
+                        # 3) Enable trigger gate (ON does not fire on your unit)
                         self.parent.setup_serial()
                         try:
                             self.parent.send_command("SENS:TRIG ON")
-                            t0 = time.time()
-                            # Verify camera consumed the trigger (docs say SENT jumps to COUNT)
-                            sent_after = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(
-                                f"SENT after TRIG ON: {sent_after}"
-                            )
-                            if (
-                                sent_before is None
-                                or sent_after is None
-                                or int(sent_after) <= int(sent_before or -1)
-                            ):
+                            sent0 = self.parent.query_trigger_sent()
+                            self.parent.print_terminal(f"SENT after TRIG ON (should be 0): {sent0}")
+                        finally:
+                            self.parent.CL.SerialClose()
+
+                        # 4) FIRE exactly 1 shot by (re)setting COUNT while trigger is ON
+                        self.parent.setup_serial()
+                        try:
+                            self.parent.send_command("SENS:TRIG:COUNT 1")
+                            # Give device a beat to update counter
+                            time.sleep(0.02)
+                            sent1 = self.parent.query_trigger_sent()
+                            self.parent.print_terminal(f"SENT after COUNT 1 (should be 1): {sent1}")
+                            if sent1 is None or int(sent1) < 1:
                                 raise RuntimeError(
-                                    "Camera did not consume trigger (SENT did not increment)."
+                                    f"Camera did not consume trigger (SENT={sent1}); "
+                                    "TRIG ON + COUNT 1 should fire one shot in INT mode."
                                 )
                         finally:
                             self.parent.CL.SerialClose()
 
+                        # 5) Time from fire → buffer
+                        t0 = time.time()
                         exp = float(self.parent.current_exposure_time or 0.0)
-                        readout_slack = 8.0  # seconds
-                        wait_ms = int((exp + readout_slack) * 1000)
+                        slack_s = 8.0
+                        wait_ms = int((exp + slack_s) * 1000)
+                        hard_deadline = t0 + exp + slack_s + 10.0
 
                         self.parent.print_terminal(
-                            f"Fired 1-shot (INT). Expect frame in ~{exp:.1f}s + readout."
+                            f"Fired 1-shot via COUNT. Expect frame in ~{exp:.1f}s + readout."
                         )
 
-                        # 3) Wait for the frame without tearing down mid-exposure.
-                        # Keep waiting until we’re comfortably past expected finish.
-                        hard_deadline = t0 + exp + readout_slack + 10.0  # extra safety
                         got_frame = False
                         while True:
                             try:
@@ -347,11 +350,10 @@ class CaptureThread(QThread):
                                 got_frame = True
                                 break
                             except Buf.PythonMemException:
-                                now = time.time()
-                                # If we are still within the expected window, keep waiting.
-                                if now < hard_deadline:
+                                if time.time() < hard_deadline:
+                                    # Exposure likely still in-flight; keep waiting without teardown
                                     continue
-                                # We’re late: one last short wait before giving up
+                                # One last short wait, then give up
                                 try:
                                     curBuf = CirAq.WaitForFrame(3000)
                                     bufnum = curBuf.BufferNumber
@@ -359,19 +361,17 @@ class CaptureThread(QThread):
                                     got_frame = True
                                     break
                                 except Buf.PythonMemException:
-                                    raise TimeoutError(
-                                        "No frame received after exposure + slack."
-                                    )
+                                    raise TimeoutError("No frame received after exposure + slack.")
 
                         total_time = t1 - t0
                         self.parent.print_terminal(
-                            f"Total acquisition time (trigger→buffer): {total_time:.3f} s"
+                            f"Total acquisition time (fire→buffer): {total_time:.3f} s"
                         )
 
                         img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
 
                     finally:
-                        # 4) Safety disarm and cleanup.
+                        # 6) Safety disarm and cleanup
                         try:
                             self.parent.setup_serial()
                             try:
@@ -380,13 +380,12 @@ class CaptureThread(QThread):
                                 self.parent.CL.SerialClose()
                         except Exception:
                             pass
-                        if CirAq is not None:
-                            try:
-                                CirAq.AqCleanup()
-                                CirAq.BufferCleanup()
-                                CirAq.Close()
-                            except Exception:
-                                pass
+        if CirAq is not None:
+            try:
+                CirAq.AqCleanup(); CirAq.BufferCleanup(); CirAq.Close()
+            except Exception:
+                pass
+
 
                 else:
                     CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
