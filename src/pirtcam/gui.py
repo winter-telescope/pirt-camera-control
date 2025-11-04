@@ -277,24 +277,27 @@ class CaptureThread(QThread):
                 self.frame_captured.emit(i + 1, self.nframes)
 
                 # Capture logic
-                # --- SINGLE mode: INT source; TRIG ON should consume COUNT immediately ---
+                # SINGLE trigger mode logic:
                 if self.trigmode is TrigMode.SINGLE:
                     CirAq = None
                     try:
-                        # 0) Reset and preload COUNT=1
+                        # Keep serial open for the entire sequence
                         self.parent.setup_serial()
-                        try:
-                            self.parent.send_command("SENS:TRIG OFF")
-                            time.sleep(0.01)
-                            self.parent.send_command("SENS:TRIG:COUNT 1")
 
-                            # Log COUNT and SENT baselines
-                            cnt0 = self.parent.query_scalar("SENS:TRIG:COUNT?")
-                            sent0 = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(f"COUNT? before fire: {cnt0}")
-                            self.parent.print_terminal(f"SENT?  before fire: {sent0}")
-                        finally:
-                            self.parent.CL.SerialClose()
+                        # 0) Reset and preload COUNT=1
+                        self.parent.send_command("SENS:TRIG OFF")
+                        time.sleep(0.1)  # Give camera time to process
+                        self.parent.send_command("SENS:TRIG:COUNT 1")
+                        time.sleep(0.1)
+
+                        # Log COUNT and SENT baselines
+                        cnt0 = self.parent.query_scalar("SENS:TRIG:COUNT?")
+                        sent0 = self.parent.query_scalar("SENS:TRIG:SENT?")
+                        self.parent.print_terminal(f"COUNT? before fire: {cnt0}")
+                        self.parent.print_terminal(f"SENT?  before fire: {sent0}")
+
+                        # Close serial before arming grabber (critical for timing)
+                        self.parent.CL.SerialClose()
 
                         # 1) Arm the grabber BEFORE firing
                         CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
@@ -306,109 +309,115 @@ class CaptureThread(QThread):
                             Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
                         )
 
+                        # Small delay to ensure grabber is ready
+                        time.sleep(0.05)
+
                         # 2) Fire by enabling triggers (TRIG ON)
                         self.parent.setup_serial()
-                        try:
-                            self.parent.send_command("SENS:TRIG ON")
-                        finally:
-                            self.parent.CL.SerialClose()
+                        self.parent.send_command("SENS:TRIG ON")
+
+                        # Critical: Wait for camera to process before checking SENT
+                        time.sleep(0.2)
+
                         t0 = time.time()
 
-                        # 3) Verify: poll SENT? for up to ~300 ms to catch delayed update
+                        # 3) Verify trigger was consumed - SENT should increment
                         fired = False
-                        for _ in range(30):  # 30 * 10ms = 300ms
-                            sent1 = self.parent.query_trigger_sent()
-                            if sent1 is not None and int(sent1) > int(sent0 or -1):
-                                fired = True
-                                break
-                            time.sleep(0.01)
-
-                        # 4) If not seen, try a second TRIG ON (doc shows it can add another batch)
-                        if not fired:
+                        for attempt in range(
+                            10
+                        ):  # 10 attempts, 50ms each = 500ms total
+                            sent1 = self.parent.query_scalar("SENS:TRIG:SENT?")
                             self.parent.print_terminal(
-                                "SENT did not increment; issuing TRIG ON again"
+                                f"Attempt {attempt+1}: SENT = {sent1}"
                             )
-                            self.parent.setup_serial()
-                            try:
-                                self.parent.send_command("SENS:TRIG ON")
-                            finally:
-                                self.parent.CL.SerialClose()
 
-                            for _ in range(30):
-                                sent1 = self.parent.query_trigger_sent()
-                                if sent1 is not None and int(sent1) > int(sent0 or -1):
-                                    fired = True
-                                    break
-                                time.sleep(0.01)
+                            if sent1 is not None:
+                                try:
+                                    if int(sent1) > int(sent0 or 0):
+                                        fired = True
+                                        self.parent.print_terminal(
+                                            f"Trigger consumed! SENT changed: {sent0} -> {sent1}"
+                                        )
+                                        break
+                                except (ValueError, TypeError):
+                                    pass
 
-                        # 5) Log post-fire COUNT and SENT; bail early if still not fired
+                            time.sleep(0.05)
+
+                        # 4) Log final state
                         cnt1 = self.parent.query_scalar("SENS:TRIG:COUNT?")
-                        self.parent.print_terminal(
-                            f"COUNT? after fire attempt(s): {cnt1}"
-                        )
-                        self.parent.print_terminal(
-                            f"SENT?  after fire attempt(s): {sent1}"
-                        )
+                        self.parent.print_terminal(f"COUNT? after fire: {cnt1}")
+                        self.parent.print_terminal(f"SENT?  after fire: {sent1}")
+
+                        # Close serial before waiting for frame
+                        self.parent.CL.SerialClose()
+
                         if not fired:
                             raise RuntimeError(
-                                "Camera did not consume trigger (SENT did not increment). "
-                                "Based on manual test this should be INT mode + TRIG ON, "
-                                "so check that this path is hitting the same serial interface."
+                                f"Camera did not consume trigger. SENT stayed at {sent0}. "
+                                f"Check trigger mode (should be INT) with SENS:TRIG:MODE?"
                             )
 
-                        # 6) Wait for the frame (exposure + slack); do NOT teardown mid-exposure
+                        # 5) Wait for the frame
                         exp = float(self.parent.current_exposure_time or 0.0)
                         slack_s = 8.0
                         wait_ms = int((exp + slack_s) * 1000)
                         hard_deadline = t0 + exp + slack_s + 10.0
+
                         self.parent.print_terminal(
-                            f"Fired 1-shot. Expect frame ~{exp:.1f}s + readout (wait {wait_ms} ms)."
+                            f"Trigger fired. Waiting for frame (exp={exp:.1f}s + overhead)..."
                         )
 
-                        while True:
+                        frame_received = False
+                        while time.time() < hard_deadline:
                             try:
                                 curBuf = CirAq.WaitForFrame(wait_ms)
                                 bufnum = curBuf.BufferNumber
                                 t1 = time.time()
+                                frame_received = True
                                 break
                             except Buf.PythonMemException:
+                                # Timeout, but we might still be before deadline
                                 if time.time() < hard_deadline:
-                                    continue
-                                # one last short wait, then give up
-                                try:
-                                    curBuf = CirAq.WaitForFrame(3000)
-                                    bufnum = curBuf.BufferNumber
-                                    t1 = time.time()
-                                    break
-                                except Buf.PythonMemException:
-                                    raise TimeoutError(
-                                        "No frame received after exposure + slack."
+                                    self.parent.print_terminal(
+                                        "Still waiting for frame..."
                                     )
+                                    wait_ms = int((hard_deadline - time.time()) * 1000)
+                                    if wait_ms > 0:
+                                        continue
+                                break
+
+                        if not frame_received:
+                            raise TimeoutError(
+                                f"No frame received after {time.time() - t0:.1f}s "
+                                f"(expected ~{exp:.1f}s + readout)"
+                            )
 
                         total_time = t1 - t0
                         self.parent.print_terminal(
-                            f"Total acquisition time (fire→buffer): {total_time:.3f} s"
+                            f"Frame received! Total time: {total_time:.3f}s"
                         )
 
                         img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
 
                     finally:
-                        # safety disarm + cleanup
+                        # Safety: ensure trigger is off and cleanup
                         try:
                             self.parent.setup_serial()
-                            try:
-                                self.parent.send_command("SENS:TRIG OFF")
-                            finally:
-                                self.parent.CL.SerialClose()
-                        except Exception:
-                            pass
+                            self.parent.send_command("SENS:TRIG OFF")
+                            self.parent.CL.SerialClose()
+                        except Exception as e:
+                            self.parent.print_terminal(f"Error in cleanup: {e}")
+
                         if CirAq is not None:
                             try:
                                 CirAq.AqCleanup()
                                 CirAq.BufferCleanup()
                                 CirAq.Close()
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                self.parent.print_terminal(
+                                    f"Error cleaning up grabber: {e}"
+                                )
 
                 else:
                     CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
