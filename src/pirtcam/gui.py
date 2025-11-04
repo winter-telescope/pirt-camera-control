@@ -277,26 +277,26 @@ class CaptureThread(QThread):
                 self.frame_captured.emit(i + 1, self.nframes)
 
                 # Capture logic
-                # --- SINGLE mode: INT source, COUNT 1 + TRIG ON fires one exposure ---
+                # --- SINGLE mode: INT source; TRIG ON should consume COUNT immediately ---
                 if self.trigmode is TrigMode.SINGLE:
                     CirAq = None
                     try:
-                        # 0) Prime (do NOT start exposure yet)
+                        # 0) Reset and preload COUNT=1
                         self.parent.setup_serial()
                         try:
-                            self.parent.print_terminal("Current trigger mode: INT")
                             self.parent.send_command("SENS:TRIG OFF")
                             time.sleep(0.01)
                             self.parent.send_command("SENS:TRIG:COUNT 1")
-                            # Read baseline SENT (should be 0 now per docs)
-                            sent_before = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(
-                                f"SENT before TRIG ON: {sent_before}"
-                            )
+
+                            # Log COUNT and SENT baselines
+                            cnt0 = self.parent.query_scalar("SENS:TRIG:COUNT?")
+                            sent0 = self.parent.query_trigger_sent()
+                            self.parent.print_terminal(f"COUNT? before fire: {cnt0}")
+                            self.parent.print_terminal(f"SENT?  before fire: {sent0}")
                         finally:
                             self.parent.CL.SerialClose()
 
-                        # 1) Bring up acquisition BEFORE firing so DMA is ready
+                        # 1) Arm the grabber BEFORE firing
                         CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                         CirAq.Open(0)
                         numbuffers = 3
@@ -306,57 +306,79 @@ class CaptureThread(QThread):
                             Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
                         )
 
-                        # 2) Fire now (INT: TRIG ON consumes COUNT immediately)
+                        # 2) Fire by enabling triggers (TRIG ON)
                         self.parent.setup_serial()
                         try:
                             self.parent.send_command("SENS:TRIG ON")
-                            t0 = time.time()
-                            # Verify camera consumed the trigger (docs say SENT jumps to COUNT)
-                            sent_after = self.parent.query_trigger_sent()
-                            self.parent.print_terminal(
-                                f"SENT after TRIG ON: {sent_after}"
-                            )
-                            if (
-                                sent_before is None
-                                or sent_after is None
-                                or int(sent_after) <= int(sent_before or -1)
-                            ):
-                                raise RuntimeError(
-                                    "Camera did not consume trigger (SENT did not increment)."
-                                )
                         finally:
                             self.parent.CL.SerialClose()
+                        t0 = time.time()
 
-                        exp = float(self.parent.current_exposure_time or 0.0)
-                        readout_slack = 8.0  # seconds
-                        wait_ms = int((exp + readout_slack) * 1000)
+                        # 3) Verify: poll SENT? for up to ~300 ms to catch delayed update
+                        fired = False
+                        for _ in range(30):  # 30 * 10ms = 300ms
+                            sent1 = self.parent.query_trigger_sent()
+                            if sent1 is not None and int(sent1) > int(sent0 or -1):
+                                fired = True
+                                break
+                            time.sleep(0.01)
 
+                        # 4) If not seen, try a second TRIG ON (doc shows it can add another batch)
+                        if not fired:
+                            self.parent.print_terminal(
+                                "SENT did not increment; issuing TRIG ON again"
+                            )
+                            self.parent.setup_serial()
+                            try:
+                                self.parent.send_command("SENS:TRIG ON")
+                            finally:
+                                self.parent.CL.SerialClose()
+
+                            for _ in range(30):
+                                sent1 = self.parent.query_trigger_sent()
+                                if sent1 is not None and int(sent1) > int(sent0 or -1):
+                                    fired = True
+                                    break
+                                time.sleep(0.01)
+
+                        # 5) Log post-fire COUNT and SENT; bail early if still not fired
+                        cnt1 = self.parent.query_scalar("SENS:TRIG:COUNT?")
                         self.parent.print_terminal(
-                            f"Fired 1-shot (INT). Expect frame in ~{exp:.1f}s + readout."
+                            f"COUNT? after fire attempt(s): {cnt1}"
+                        )
+                        self.parent.print_terminal(
+                            f"SENT?  after fire attempt(s): {sent1}"
+                        )
+                        if not fired:
+                            raise RuntimeError(
+                                "Camera did not consume trigger (SENT did not increment). "
+                                "Based on manual test this should be INT mode + TRIG ON, "
+                                "so check that this path is hitting the same serial interface."
+                            )
+
+                        # 6) Wait for the frame (exposure + slack); do NOT teardown mid-exposure
+                        exp = float(self.parent.current_exposure_time or 0.0)
+                        slack_s = 8.0
+                        wait_ms = int((exp + slack_s) * 1000)
+                        hard_deadline = t0 + exp + slack_s + 10.0
+                        self.parent.print_terminal(
+                            f"Fired 1-shot. Expect frame ~{exp:.1f}s + readout (wait {wait_ms} ms)."
                         )
 
-                        # 3) Wait for the frame without tearing down mid-exposure.
-                        # Keep waiting until we’re comfortably past expected finish.
-                        hard_deadline = t0 + exp + readout_slack + 10.0  # extra safety
-                        got_frame = False
                         while True:
                             try:
                                 curBuf = CirAq.WaitForFrame(wait_ms)
                                 bufnum = curBuf.BufferNumber
                                 t1 = time.time()
-                                got_frame = True
                                 break
                             except Buf.PythonMemException:
-                                now = time.time()
-                                # If we are still within the expected window, keep waiting.
-                                if now < hard_deadline:
+                                if time.time() < hard_deadline:
                                     continue
-                                # We’re late: one last short wait before giving up
+                                # one last short wait, then give up
                                 try:
                                     curBuf = CirAq.WaitForFrame(3000)
                                     bufnum = curBuf.BufferNumber
                                     t1 = time.time()
-                                    got_frame = True
                                     break
                                 except Buf.PythonMemException:
                                     raise TimeoutError(
@@ -365,13 +387,13 @@ class CaptureThread(QThread):
 
                         total_time = t1 - t0
                         self.parent.print_terminal(
-                            f"Total acquisition time (trigger→buffer): {total_time:.3f} s"
+                            f"Total acquisition time (fire→buffer): {total_time:.3f} s"
                         )
 
                         img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
 
                     finally:
-                        # 4) Safety disarm and cleanup.
+                        # safety disarm + cleanup
                         try:
                             self.parent.setup_serial()
                             try:
