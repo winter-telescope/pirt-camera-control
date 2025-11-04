@@ -609,7 +609,7 @@ class SciCamGUI(QWidget):
         self.current_exposure_time = 0.0
 
         # Initialize capture thread
-        self.capture_thread = CaptureThread(self, trigmode=self.trigmode)
+        self.capture_thread = CaptureThread(parent=self, trigmode=self.trigmode)
         self.capture_thread.status_update.connect(self.on_capture_status_update)
         self.capture_thread.frame_captured.connect(self.on_frame_captured)
         self.capture_thread.capture_complete.connect(self.on_capture_complete)
