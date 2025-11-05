@@ -159,7 +159,7 @@ class ImageViewer(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PIRT Quick Look Viewer")
-        self.setGeometry(750, 100, 600, 600)
+        self.setGeometry(750, 100, 600, 750)
 
         # cache of last rendered images so we can rescale on resize without recomputing
         self._last_qimg = None
