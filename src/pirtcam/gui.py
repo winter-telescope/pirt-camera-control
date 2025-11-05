@@ -154,7 +154,7 @@ class ImageViewer(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PIRT Quick Look Viewer")
-        self.setGeometry(750, 100, 600, 600)
+        self.setGeometry(750, 100, 600, 800)
 
         # --- UI ---
 
