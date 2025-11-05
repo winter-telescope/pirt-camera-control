@@ -361,175 +361,163 @@ class CaptureThread(QThread):
                         # 3) Fire the trigger
                         self.parent.setup_serial()
                         self.parent.send_command("SENS:TRIG ON")
-                        t_first_trigger = (
-                            time.time()
-                        )  # Track the VERY FIRST trigger time
+                        t_start = time.time()
                         self.parent.CL.SerialClose()
 
                         # Get expected timing
                         exp_s = float(self.parent.current_exposure_time or 0.0)
                         expected_time = exp_s + 1.0  # Exposure + 1s overhead
+                        absolute_deadline = (
+                            t_start + expected_time + 15.0
+                        )  # Add 15s safety buffer
+
                         self.parent.print_terminal(
-                            f"[single] Trigger fired at t=0. Expected completion: ~{expected_time:.1f}s"
+                            f"[single] Trigger fired. Expected: ~{expected_time:.1f}s, "
+                            f"deadline: {expected_time + 15.0:.1f}s"
                         )
 
-                        # 4) Wait for frame with retry logic
+                        # 4) Poll for frame arrival with short waits
+                        # WaitForFrame has ~9-10s internal timeout, so we poll repeatedly
                         framearr = False
-                        max_retries = 3
-                        retry_count = 0
+                        curBuf = None
+                        bufnum = None
+                        poll_timeout_ms = (
+                            8000  # Poll every 8s (under the ~9-10s BitFlow limit)
+                        )
+                        last_status_check = t_start
+                        status_check_interval = 10.0  # Check SENT every 10s
 
-                        # IMPORTANT: Use a LONG timeout for WaitForFrame - at least exposure + 10s
-                        # The BitFlow timeout might be getting hit if we're too aggressive
-                        wait_timeout_ms = int(max(15000, (exp_s + 10.0) * 1000))
+                        while not framearr and time.time() < absolute_deadline:
+                            elapsed = time.time() - t_start
+                            remaining = absolute_deadline - time.time()
 
-                        while not framearr and retry_count < max_retries:
+                            # Use shorter of: poll_timeout or remaining time
+                            wait_ms = min(poll_timeout_ms, int(remaining * 1000))
+
+                            if wait_ms < 100:
+                                break  # Too close to deadline
+
                             try:
-                                elapsed_since_first = time.time() - t_first_trigger
-                                self.parent.print_terminal(
-                                    f"[single] Waiting for frame (timeout={wait_timeout_ms}ms, "
-                                    f"attempt {retry_count+1}/{max_retries}, elapsed={elapsed_since_first:.1f}s)..."
-                                )
-
-                                curBuf = CirAq.WaitForFrame(wait_timeout_ms)
+                                curBuf = CirAq.WaitForFrame(wait_ms)
                                 framearr = True
                                 bufnum = curBuf.BufferNumber
-                                t_done = time.time()
-                                total_time = (
-                                    t_done - t_first_trigger
-                                )  # Total time from FIRST trigger
-
-                                # Store the actual exposure duration
-                                self.parent.last_exposure_duration = total_time
-
-                                self.parent.print_terminal(
-                                    f"[single] Frame received! Total time from first trigger: {total_time:.2f}s"
-                                )
 
                             except Buf.PythonMemException:
-                                # Timeout - check if trigger actually fired
-                                retry_count += 1
-                                elapsed = time.time() - t_first_trigger
-                                self.parent.print_terminal(
-                                    f"[single] WaitForFrame timeout after {elapsed:.1f}s total "
-                                    f"(expected ~{expected_time:.1f}s)"
+                                # Timeout on this poll - check if we should keep waiting
+                                elapsed = time.time() - t_start
+
+                                # Periodically check camera status
+                                if (
+                                    time.time() - last_status_check
+                                    > status_check_interval
+                                ):
+                                    try:
+                                        self.parent.setup_serial()
+                                        cur_sent = self.parent.query_scalar(
+                                            "SENS:TRIG:SENT?"
+                                        )
+                                        trig_status = self.parent.query_scalar(
+                                            "SENS:TRIG?"
+                                        )
+                                        self.parent.CL.SerialClose()
+
+                                        self.parent.print_terminal(
+                                            f"[single] Status check at t={elapsed:.1f}s: "
+                                            f"SENT={cur_sent}, TRIG={trig_status}"
+                                        )
+
+                                        # If SENT incremented, camera finished but grabber hasn't received frame
+                                        if (
+                                            cur_sent
+                                            and sent0
+                                            and int(cur_sent) > int(sent0)
+                                        ):
+                                            self.parent.print_terminal(
+                                                "[single] Camera exposure complete, waiting for DMA transfer..."
+                                            )
+
+                                        last_status_check = time.time()
+
+                                    except Exception as e:
+                                        self.parent.print_terminal(
+                                            f"[single] Status check failed: {e}"
+                                        )
+                                        self.parent.CL.SerialClose()
+
+                                # Continue polling if still within deadline
+                                if elapsed < expected_time:
+                                    # Still within expected exposure time
+                                    continue
+                                elif elapsed < expected_time + 10.0:
+                                    # In the safety buffer - keep waiting but log
+                                    self.parent.print_terminal(
+                                        f"[single] Past expected time ({elapsed:.1f}s > {expected_time:.1f}s), "
+                                        "waiting for frame..."
+                                    )
+                                    continue
+                                else:
+                                    # Getting close to absolute deadline
+                                    self.parent.print_terminal(
+                                        f"[single] Approaching deadline at t={elapsed:.1f}s..."
+                                    )
+                                    continue
+
+                        # Check if we got the frame
+                        if not framearr or curBuf is None:
+                            elapsed = time.time() - t_start
+
+                            # Final status check
+                            try:
+                                self.parent.setup_serial()
+                                sent_final = self.parent.query_scalar("SENS:TRIG:SENT?")
+                                trig_final = self.parent.query_scalar("SENS:TRIG?")
+                                self.parent.CL.SerialClose()
+
+                                raise TimeoutError(
+                                    f"No frame after {elapsed:.1f}s (expected ~{expected_time:.1f}s). "
+                                    f"Final state: SENT={sent_final}, TRIG={trig_final}"
+                                )
+                            except TimeoutError:
+                                raise
+                            except Exception as e:
+                                raise TimeoutError(
+                                    f"No frame after {elapsed:.1f}s and status check failed: {e}"
                                 )
 
-                                # Check SENT status to diagnose
-                                try:
-                                    self.parent.setup_serial()
-                                    cur_sent = self.parent.query_scalar(
-                                        "SENS:TRIG:SENT?"
-                                    )
-                                    trig_status = self.parent.query_scalar("SENS:TRIG?")
-                                    self.parent.print_terminal(
-                                        f"[single] SENT: {sent0} → {cur_sent}, TRIG status: {trig_status}"
-                                    )
+                        # 5) Success! Calculate timing and copy frame
+                        total_time = time.time() - t_start
+                        self.parent.last_exposure_duration = total_time
 
-                                    if (
-                                        cur_sent
-                                        and sent0
-                                        and int(cur_sent) > int(sent0)
-                                    ):
-                                        # Camera exposed but frame didn't arrive - grabber issue
-                                        self.parent.print_terminal(
-                                            "[single] Camera completed exposure but no frame received. "
-                                            "Reinitializing grabber..."
-                                        )
-                                        # Don't reset trigger - camera already exposed!
-                                    else:
-                                        # Camera hasn't completed exposure yet
-                                        if elapsed < expected_time:
-                                            # We're still within expected time - camera is probably still exposing
-                                            self.parent.print_terminal(
-                                                f"[single] Camera still exposing (elapsed={elapsed:.1f}s < "
-                                                f"expected={expected_time:.1f}s). Continuing to wait..."
-                                            )
-                                            # Don't reset trigger - let it continue!
-                                        else:
-                                            # Past expected time and SENT unchanged - something's wrong
-                                            self.parent.print_terminal(
-                                                "[single] SENT unchanged after expected time. "
-                                                "Resetting trigger..."
-                                            )
-                                            self.parent.send_command("SENS:TRIG OFF")
-                                            time.sleep(0.1)
-                                            self.parent.send_command(
-                                                "SENS:TRIG:COUNT 1"
-                                            )
-                                            self.parent.send_command("SENS:TRIG ON")
-                                            # Don't update t_first_trigger - we want total time!
+                        self.parent.print_terminal(
+                            f"[single] Frame received! Total time: {total_time:.2f}s "
+                            f"(expected ~{expected_time:.1f}s)"
+                        )
 
-                                    self.parent.CL.SerialClose()
-
-                                except Exception as e:
-                                    self.parent.print_terminal(
-                                        f"[single] SENT query failed: {e}"
-                                    )
-
-                                # Reinitialize grabber
-                                try:
-                                    CirAq.AqCleanup()
-                                    CirAq.BufferCleanup()
-                                    CirAq.Close()
-                                except:
-                                    pass
-
-                                if retry_count < max_retries:
-                                    CirAq = Buf.clsCircularAcquisition(
-                                        Buf.ErrorMode.ErIgnore
-                                    )
-                                    CirAq.Open(0)
-                                    BufArr = CirAq.BufferSetup(numbuffers)
-                                    CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                                    CirAq.AqControl(
-                                        Buf.AcqCommands.Start,
-                                        Buf.AcqControlOptions.Wait,
-                                    )
-                                    time.sleep(0.05)
-
-                                    # For subsequent waits, use remaining expected time + buffer
-                                    elapsed = time.time() - t_first_trigger
-                                    remaining = max(5.0, expected_time - elapsed + 10.0)
-                                    wait_timeout_ms = int(remaining * 1000)
-                                    self.parent.print_terminal(
-                                        f"[single] Reinit complete. Next wait: {wait_timeout_ms}ms"
-                                    )
-
-                        if not framearr:
-                            elapsed = time.time() - t_first_trigger
-                            raise TimeoutError(
-                                f"Failed to capture frame after {max_retries} attempts. "
-                                f"Total elapsed: {elapsed:.1f}s (expected ~{expected_time:.1f}s). "
-                                f"Check camera state and grabber configuration."
-                            )
-
-                        # 5) Copy the frame data
                         img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
 
-                        # 6) Verify SENT incremented (critical sanity check)
+                        # 6) Verify SENT incremented
                         try:
                             self.parent.setup_serial()
                             sent_final = self.parent.query_scalar("SENS:TRIG:SENT?")
+                            self.parent.CL.SerialClose()
+
                             self.parent.print_terminal(
                                 f"[single] Final SENT: {sent0} → {sent_final}"
                             )
 
-                            # Warn if SENT didn't increment
                             if sent0 is not None and sent_final is not None:
                                 if int(sent_final) <= int(sent0):
                                     self.parent.print_terminal(
-                                        "[single] WARNING: SENT did not increment! "
-                                        "Frame may not be properly exposed."
+                                        "[single] WARNING: SENT did not increment! Frame may be invalid."
                                     )
 
-                            self.parent.CL.SerialClose()
                         except Exception as e:
                             self.parent.print_terminal(
                                 f"[single] Final SENT check failed: {e}"
                             )
 
                     finally:
-                        # 7) Always cleanup - turn off trigger and close resources
+                        # 7) Always cleanup
                         try:
                             self.parent.setup_serial()
                             self.parent.send_command("SENS:TRIG OFF")
@@ -550,6 +538,7 @@ class CaptureThread(QThread):
                                     f"[single] Cleanup: grabber error: {e}"
                                 )
 
+                # STREAM trigger mode logic:
                 else:
                     CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                     CirAq.Open(0)
