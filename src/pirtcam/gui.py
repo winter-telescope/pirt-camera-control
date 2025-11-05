@@ -254,7 +254,7 @@ class ImageViewer(QWidget):
         hist_range = (lower, upper) if std > 0 else (median - 1, median + 1)
         counts, edges = np.histogram(data.ravel(), bins=nbins, range=hist_range)
         # step plot: use edges as x, prepend a zero for visual pad if desired
-        self.hist_curve.setData(x=edges, y=np.append(counts, counts[-1]))
+        self.hist_curve.setData(x=edges, y=counts)
 
         # axis range: leave a little headroom
         self.hist_plot.setXRange(*hist_range, padding=0.02)
