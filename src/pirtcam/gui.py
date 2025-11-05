@@ -325,7 +325,8 @@ class CaptureThread(QThread):
                 self.frame_captured.emit(i + 1, self.nframes)
 
                 # Capture logic
-                # SINGLE trigger mode logic:
+                # Replace the SINGLE trigger mode section with this:
+
                 if self.trigmode is TrigMode.SINGLE:
                     CirAq = None
                     try:
@@ -333,7 +334,7 @@ class CaptureThread(QThread):
                         self.parent.setup_serial()
                         self.parent.send_command("SENS:TRIG:MODE INT")
                         time.sleep(0.05)
-                        self.parent.send_command("SENS:TRIG OFF")  # Clean state
+                        self.parent.send_command("SENS:TRIG OFF")
                         time.sleep(0.10)
                         self.parent.send_command("SENS:TRIG:COUNT 1")
                         time.sleep(0.05)
@@ -350,13 +351,13 @@ class CaptureThread(QThread):
 
                         CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
                         CirAq.Open(0)
-                        numbuffers = 3  # Use 3 buffers for safety
+                        numbuffers = 3
                         BufArr = CirAq.BufferSetup(numbuffers)
                         CirAq.AqSetup(Buf.SetupOptions.setupDefault)
                         CirAq.AqControl(
                             Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
                         )
-                        time.sleep(0.05)  # Let grabber stabilize
+                        time.sleep(0.05)
 
                         # 3) Fire the trigger
                         self.parent.setup_serial()
@@ -366,36 +367,35 @@ class CaptureThread(QThread):
 
                         # Get expected timing
                         exp_s = float(self.parent.current_exposure_time or 0.0)
-                        expected_time = exp_s + 1.0  # Exposure + 1s overhead
-                        absolute_deadline = (
-                            t_start + expected_time + 15.0
-                        )  # Add 15s safety buffer
+                        expected_time = exp_s + 1.0
 
                         self.parent.print_terminal(
-                            f"[single] Trigger fired. Expected: ~{expected_time:.1f}s, "
-                            f"deadline: {expected_time + 15.0:.1f}s"
+                            f"[single] Trigger fired at t=0. Exposure: {exp_s:.1f}s, "
+                            f"expected completion: ~{expected_time:.1f}s"
                         )
 
-                        # 4) Poll for frame arrival with short waits
-                        # WaitForFrame has ~9-10s internal timeout, so we poll repeatedly
+                        # 4) Wait for frame with BitFlow timeout workaround
+                        # BitFlow WaitForFrame has ~9-10s internal timeout, so we loop
                         framearr = False
                         curBuf = None
                         bufnum = None
-                        poll_timeout_ms = (
-                            8000  # Poll every 8s (under the ~9-10s BitFlow limit)
-                        )
-                        last_status_check = t_start
-                        status_check_interval = 10.0  # Check SENT every 10s
+
+                        # Use 8s waits (under the BitFlow ~9-10s limit)
+                        wait_chunk_ms = 8000
+                        max_wait_time = expected_time + 15.0  # Total deadline
+                        absolute_deadline = t_start + max_wait_time
+
+                        reinit_count = 0
+                        max_reinits = 5
 
                         while not framearr and time.time() < absolute_deadline:
                             elapsed = time.time() - t_start
                             remaining = absolute_deadline - time.time()
 
-                            # Use shorter of: poll_timeout or remaining time
-                            wait_ms = min(poll_timeout_ms, int(remaining * 1000))
-
+                            # Calculate this iteration's wait time
+                            wait_ms = min(wait_chunk_ms, int(remaining * 1000))
                             if wait_ms < 100:
-                                break  # Too close to deadline
+                                break
 
                             try:
                                 curBuf = CirAq.WaitForFrame(wait_ms)
@@ -403,121 +403,145 @@ class CaptureThread(QThread):
                                 bufnum = curBuf.BufferNumber
 
                             except Buf.PythonMemException:
-                                # Timeout on this poll - check if we should keep waiting
                                 elapsed = time.time() - t_start
 
-                                # Periodically check camera status
-                                if (
-                                    time.time() - last_status_check
-                                    > status_check_interval
-                                ):
-                                    try:
-                                        self.parent.setup_serial()
-                                        cur_sent = self.parent.query_scalar(
-                                            "SENS:TRIG:SENT?"
-                                        )
-                                        trig_status = self.parent.query_scalar(
-                                            "SENS:TRIG?"
-                                        )
-                                        self.parent.CL.SerialClose()
+                                # Check if camera has finished exposing
+                                try:
+                                    self.parent.setup_serial()
+                                    cur_sent = self.parent.query_scalar(
+                                        "SENS:TRIG:SENT?"
+                                    )
+                                    self.parent.CL.SerialClose()
 
+                                    camera_done = (
+                                        cur_sent
+                                        and sent0
+                                        and int(cur_sent) > int(sent0)
+                                    )
+
+                                    if camera_done and elapsed > expected_time:
+                                        # Camera finished but no frame - grabber issue
                                         self.parent.print_terminal(
-                                            f"[single] Status check at t={elapsed:.1f}s: "
-                                            f"SENT={cur_sent}, TRIG={trig_status}"
+                                            f"[single] t={elapsed:.1f}s: Camera done (SENT={cur_sent}), "
+                                            f"but no frame. Reinitializing grabber..."
                                         )
 
-                                        # If SENT incremented, camera finished but grabber hasn't received frame
-                                        if (
-                                            cur_sent
-                                            and sent0
-                                            and int(cur_sent) > int(sent0)
-                                        ):
-                                            self.parent.print_terminal(
-                                                "[single] Camera exposure complete, waiting for DMA transfer..."
+                                        # Reinit grabber to try to get the frame
+                                        try:
+                                            CirAq.AqCleanup()
+                                            CirAq.BufferCleanup()
+                                            CirAq.Close()
+                                        except:
+                                            pass
+
+                                        reinit_count += 1
+                                        if reinit_count >= max_reinits:
+                                            raise TimeoutError(
+                                                f"Camera exposed (SENT={cur_sent}) but frame never arrived "
+                                                f"after {reinit_count} grabber reinits. Check Camera Link cable."
                                             )
 
-                                        last_status_check = time.time()
-
-                                    except Exception as e:
-                                        self.parent.print_terminal(
-                                            f"[single] Status check failed: {e}"
+                                        CirAq = Buf.clsCircularAcquisition(
+                                            Buf.ErrorMode.ErIgnore
                                         )
-                                        self.parent.CL.SerialClose()
+                                        CirAq.Open(0)
+                                        BufArr = CirAq.BufferSetup(numbuffers)
+                                        CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                                        CirAq.AqControl(
+                                            Buf.AcqCommands.Start,
+                                            Buf.AcqControlOptions.Wait,
+                                        )
+                                        time.sleep(0.05)
 
-                                # Continue polling if still within deadline
-                                if elapsed < expected_time:
-                                    # Still within expected exposure time
-                                    continue
-                                elif elapsed < expected_time + 10.0:
-                                    # In the safety buffer - keep waiting but log
+                                    elif elapsed < expected_time:
+                                        # Still exposing - just continue waiting
+                                        self.parent.print_terminal(
+                                            f"[single] t={elapsed:.1f}s: Still exposing (SENT={cur_sent})..."
+                                        )
+                                    else:
+                                        # Past expected time but SENT hasn't incremented
+                                        self.parent.print_terminal(
+                                            f"[single] t={elapsed:.1f}s: Past expected time but SENT={cur_sent}, "
+                                            "continuing to wait..."
+                                        )
+
+                                except Exception as e:
                                     self.parent.print_terminal(
-                                        f"[single] Past expected time ({elapsed:.1f}s > {expected_time:.1f}s), "
-                                        "waiting for frame..."
+                                        f"[single] Status check error: {e}"
                                     )
-                                    continue
-                                else:
-                                    # Getting close to absolute deadline
-                                    self.parent.print_terminal(
-                                        f"[single] Approaching deadline at t={elapsed:.1f}s..."
-                                    )
+                                    # Continue waiting even if status check fails
                                     continue
 
                         # Check if we got the frame
                         if not framearr or curBuf is None:
                             elapsed = time.time() - t_start
 
-                            # Final status check
+                            # Final diagnostics
                             try:
                                 self.parent.setup_serial()
                                 sent_final = self.parent.query_scalar("SENS:TRIG:SENT?")
                                 trig_final = self.parent.query_scalar("SENS:TRIG?")
                                 self.parent.CL.SerialClose()
 
-                                raise TimeoutError(
+                                error_msg = (
                                     f"No frame after {elapsed:.1f}s (expected ~{expected_time:.1f}s). "
-                                    f"Final state: SENT={sent_final}, TRIG={trig_final}"
+                                    f"SENT: {sent0}→{sent_final}, TRIG: {trig_final}"
                                 )
+
+                                if (
+                                    sent_final
+                                    and sent0
+                                    and int(sent_final) > int(sent0)
+                                ):
+                                    error_msg += ". Camera exposed but frame lost - check Camera Link connection."
+                                else:
+                                    error_msg += (
+                                        ". Camera may not have triggered properly."
+                                    )
+
+                                raise TimeoutError(error_msg)
+
                             except TimeoutError:
                                 raise
                             except Exception as e:
                                 raise TimeoutError(
-                                    f"No frame after {elapsed:.1f}s and status check failed: {e}"
+                                    f"No frame after {elapsed:.1f}s and diagnostics failed: {e}"
                                 )
 
-                        # 5) Success! Calculate timing and copy frame
+                        # 5) Success!
                         total_time = time.time() - t_start
                         self.parent.last_exposure_duration = total_time
 
                         self.parent.print_terminal(
-                            f"[single] Frame received! Total time: {total_time:.2f}s "
+                            f"[single] Frame received! Actual time: {total_time:.2f}s "
                             f"(expected ~{expected_time:.1f}s)"
                         )
 
                         img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
 
-                        # 6) Verify SENT incremented
+                        # 6) Verify SENT
                         try:
                             self.parent.setup_serial()
                             sent_final = self.parent.query_scalar("SENS:TRIG:SENT?")
                             self.parent.CL.SerialClose()
 
                             self.parent.print_terminal(
-                                f"[single] Final SENT: {sent0} → {sent_final}"
+                                f"[single] SENT: {sent0} → {sent_final}"
                             )
 
                             if sent0 is not None and sent_final is not None:
                                 if int(sent_final) <= int(sent0):
                                     self.parent.print_terminal(
-                                        "[single] WARNING: SENT did not increment! Frame may be invalid."
+                                        "[single] WARNING: SENT did not increment!"
                                     )
 
                         except Exception as e:
                             self.parent.print_terminal(
-                                f"[single] Final SENT check failed: {e}"
+                                f"[single] SENT check failed: {e}"
                             )
 
                     finally:
-                        # 7) Always cleanup
+                        # 7) Cleanup
                         try:
                             self.parent.setup_serial()
                             self.parent.send_command("SENS:TRIG OFF")
@@ -525,7 +549,7 @@ class CaptureThread(QThread):
                             self.parent.print_terminal("[single] Trigger disabled")
                         except Exception as e:
                             self.parent.print_terminal(
-                                f"[single] Cleanup: TRIG OFF failed: {e}"
+                                f"[single] Cleanup TRIG OFF failed: {e}"
                             )
 
                         if CirAq is not None:
@@ -535,7 +559,7 @@ class CaptureThread(QThread):
                                 CirAq.Close()
                             except Exception as e:
                                 self.parent.print_terminal(
-                                    f"[single] Cleanup: grabber error: {e}"
+                                    f"[single] Cleanup grabber failed: {e}"
                                 )
 
                 # STREAM trigger mode logic:
