@@ -6,3 +6,4 @@ __pycache__/
 *.pyo
 *egg-info/
 *_version.py
+*.DS_Store*

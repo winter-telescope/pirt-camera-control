@@ -22,6 +22,7 @@ dependencies = [
     "astropy",
     "PyQt5",
     "matplotlib",
+    "pyqtgraph",
     "Pyro5",
 ]
 

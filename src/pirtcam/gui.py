@@ -5,19 +5,21 @@ import sys
 os.add_dll_directory(r"C:\BitFlow SDK 6.5\Bin64")
 os.add_dll_directory(r"C:\Program Files\CameraLink\Serial")
 
+import getopt
 import json
 import socket
 import threading
 import time
 from datetime import datetime, timezone
+from enum import Enum, auto
+from pathlib import Path
 
 import BFModule.BufferAcquisition as Buf
 import BFModule.CLComm as CLCom
 import numpy as np
+import pyqtgraph as pg
 from astropy.io import fits
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtNetwork import QHostAddress, QTcpServer
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -26,11 +28,17 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+
+class TrigMode(str, Enum):
+    SINGLE = "SINGLE"
+    STREAM = "STREAM"
 
 
 class CommandServer(QThread):
@@ -73,18 +81,45 @@ class CommandServer(QThread):
     def handle_client(self, client):
         """Handle individual client connections"""
         self.clients.append(client)
+        buffer = ""  # Buffer to accumulate data
+
         try:
             while self.running:
                 try:
-                    data = client.recv(1024)
+                    data = client.recv(4096)
                     if not data:
                         break
 
-                    # Decode command
-                    command = data.decode("utf-8").strip()
-                    if command:
-                        print(f"Received command: {command}")
-                        self.command_received.emit(command)
+                    # Decode and add to buffer
+                    buffer += data.decode("utf-8")
+
+                    # Process complete messages (newline-delimited)
+                    while True:
+                        # Look for newline delimiter
+                        newline_index = buffer.find("\n")
+                        if newline_index == -1:
+                            # No complete message yet
+                            break
+
+                        # Extract the complete message
+                        command = buffer[:newline_index]
+                        buffer = buffer[newline_index + 1 :]  # Keep remainder in buffer
+
+                        command = command.strip()
+                        if command:
+                            # Only print received command if it's not GET_STATUS
+                            try:
+                                cmd_data = json.loads(command)
+                                if cmd_data.get("command", "").upper() != "GET_STATUS":
+                                    print(
+                                        f"Received command: {command[:100]}..."
+                                    )  # Print first 100 chars
+                            except:
+                                # If we can't parse it, print it anyway
+                                print(
+                                    f"Received command: {command[:100]}..."
+                                )  # Print first 100 chars
+                            self.command_received.emit(command)
 
                 except socket.timeout:
                     continue
@@ -115,97 +150,757 @@ class CommandServer(QThread):
 
 
 class ImageViewer(QWidget):
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.figure import Figure
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PIRT Quick Look Viewer")
-        self.setGeometry(750, 100, 600, 600)
-        self.layout = QVBoxLayout()
-        self.image_label = QLabel("No image yet")
-        self.image_label.setAlignment(Qt.AlignCenter)
-        image_hist_split = QVBoxLayout()
-        image_hist_split.setContentsMargins(0, 0, 0, 0)
-        image_hist_split.setSpacing(2)
-        image_hist_split.addWidget(self.image_label, stretch=5)
-        self.hist_label = QLabel()
-        self.hist_label.setAlignment(Qt.AlignCenter)
-        image_hist_split.addWidget(self.hist_label, stretch=1)
-        self.layout.addLayout(image_hist_split)
-        self.hist_label.setAlignment(Qt.AlignCenter)
+        self.setGeometry(750, 100, 600, 800)
 
-        self.setLayout(self.layout)
+        # --- UI ---
 
-    def update_image(self, data):
-        median = np.median(data)
-        std = np.std(data)
+        self._pg = pg  # stash to avoid re-imports
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
+        # Graphics layout holds both the image and the histogram plot
+        self.glw = pg.GraphicsLayoutWidget()
+        root.addWidget(self.glw)
+
+        # Top: image view with square pixels (locked aspect)
+        self.img_vb = self.glw.addViewBox(
+            row=0, col=0, lockAspect=True, enableMenu=False
+        )
+        self.img_vb.setDefaultPadding(0.0)
+        self.img_item = pg.ImageItem(axisOrder="row-major")
+        self.img_vb.addItem(self.img_item)
+
+        # Bottom: histogram plot (vector graphics, scales cleanly)
+        self.glw.nextRow()
+        self.hist_plot: pg.PlotItem = self.glw.addPlot(row=1, col=0)
+        self.hist_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.hist_plot.setLabel("bottom", "ADU")
+        self.hist_plot.setLabel("left", "Count")
+        self.hist_curve = self.hist_plot.plot(
+            stepMode=True, fillLevel=0, brush=(200, 200, 200, 160)
+        )
+        self.hist_plot.setMenuEnabled(False)
+        self.hist_plot.setMouseEnabled(x=True, y=False)
+
+        # a grayscale LUT (optional; looks nice)
+        lut = self._pg.ColorMap(
+            [0.0, 1.0], [[0, 0, 0], [255, 255, 255]]
+        ).getLookupTable(0.0, 1.0, 256)
+        self.img_item.setLookupTable(lut)
+        self.img_item.setLevels([0, 255])
+
+        # cached last image shape (to set correct view range once)
+        self._last_shape = None
+
+        # initial font sizing
+        self._apply_axis_fonts()
+
+    def _apply_axis_fonts(self):
+        """Scale axis/tick fonts based on the widget height so labels stay readable."""
+        import pyqtgraph as pg
+
+        h = max(1, self.height())
+        # heuristic: 2.5% of height for titles, 2% for ticks; clamp to [7, 14]
+        tick_pt = int(max(7, min(14, 0.020 * h)))
+        title_pt = int(max(8, min(16, 0.025 * h)))
+
+        ax = self.hist_plot.getAxis("bottom")
+        ay = self.hist_plot.getAxis("left")
+        ax.setStyle(tickFont=self._pg.QtGui.QFont("", tick_pt))
+        ay.setStyle(tickFont=self._pg.QtGui.QFont("", tick_pt))
+        self.hist_plot.getAxis("bottom").setHeight(max(18, tick_pt * 2))
+        self.hist_plot.getAxis("left").setWidth(max(28, tick_pt * 2))
+
+        # Title as part of plot (optional)
+        # self.hist_plot.setTitle("Histogram", size=f"{title_pt}pt")
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._apply_axis_fonts()
+
+    def update_image(self, data: np.ndarray):
+        """Render clipped image + histogram, with square-pixel image and vector histogram."""
+        import numpy as np
+
+        # --- robust clip (zscale-like simple 3σ around median) ---
+        median = float(np.median(data))
+        std = float(np.std(data))
         lower = median - 3 * std
         upper = median + 3 * std
         clipped = np.clip(data, lower, upper)
-        norm_data = 255 * (clipped - lower) / (upper - lower if upper > lower else 1)
-        norm_data = norm_data.astype(np.uint8)
+        # normalize to 0..255 for display; keep underlying dtype for FITS saving elsewhere
+        denom = (upper - lower) if upper > lower else 1.0
+        norm = ((clipped - lower) * (255.0 / denom)).astype(np.uint8)
 
-        from io import BytesIO
+        # --- image display ---
+        # pyqtgraph accepts 2D arrays directly; square pixels guaranteed by lockAspect=True
+        self.img_item.setImage(norm, autoLevels=False)
 
-        import matplotlib.pyplot as plt
+        # set view range once (keeps square aspect without stretching)
+        if self._last_shape != norm.shape:
+            h, w = norm.shape
+            self.img_vb.setRange(xRange=(0, w), yRange=(0, h), padding=0.0)
+            self._last_shape = norm.shape
 
-        plt.figure(figsize=(4, 2))
-        plt.hist(
-            data.ravel(),
-            bins=256,
-            color="gray",
-            alpha=0.75,
-            range=(median - 3 * std, median + 3 * std),
-        )
-        mean = np.mean(data)
-        mode = np.bincount(data.ravel()).argmax() if data.size > 0 else 0
-        plt.title(
-            f"Histogram | Mean: {mean:.1f}, Median: {median:.1f}, Mode: {mode}, Std: {std:.1f}",
-            fontsize=8,
-        )
-        plt.tight_layout()
-        buf = BytesIO()
-        plt.savefig(buf, format="png")
-        buf.seek(0)
-        plt.close()
+        # --- histogram (vector, no raster scaling) ---
+        # bins focused around the same clipping range for consistency
+        nbins = 256
+        hist_range = (lower, upper) if std > 0 else (median - 1, median + 1)
+        counts, edges = np.histogram(data.ravel(), bins=nbins, range=hist_range)
+        # step plot: use edges as x, prepend a zero for visual pad if desired
+        self.hist_curve.setData(x=edges, y=counts)
 
-        qimg_hist = QImage()
-        qimg_hist.loadFromData(buf.read(), "PNG")
-        self.hist_label.setPixmap(
-            QPixmap.fromImage(qimg_hist).scaledToWidth(
-                self.width(), Qt.SmoothTransformation
-            )
+        # axis range: leave a little headroom
+        self.hist_plot.setXRange(*hist_range, padding=0.02)
+        ymax = max(1, counts.max())
+        self.hist_plot.setYRange(0, ymax * 1.1)
+
+        # Optional subtitle text (no squish)
+        mean = float(np.mean(data))
+        mode = int(np.bincount(data.ravel()).argmax()) if data.size > 0 else 0
+        self.hist_plot.setTitle(
+            f"Mean: {mean:.1f} | Med: {median:.1f} | Mode: {mode} | Std: {std:.1f}",
+            size="10pt",
         )
-        h, w = norm_data.shape
-        qimg = QImage(norm_data.data, w, h, w, QImage.Format_Grayscale8)
-        self.image_label.setPixmap(
-            QPixmap.fromImage(qimg).scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
+
+
+class CaptureThread(QThread):
+    """Thread for capturing frames without blocking the GUI"""
+
+    status_update = pyqtSignal(str)
+    frame_captured = pyqtSignal(int, int)  # current, total
+    capture_complete = pyqtSignal()
+    capture_error = pyqtSignal(str)
+    image_ready = pyqtSignal(np.ndarray)
+    notification = pyqtSignal(dict)
+
+    def __init__(self, parent=None, trigmode: TrigMode = TrigMode.SINGLE):
+        super().__init__(parent)
+        self.parent = parent
+        self.nframes = 1
+        self.save_as_stack = False
+        self.custom_headers = {}
+        self.trigmode = trigmode
+        self.custom_filename = None
+
+    def setup_capture(
+        self, nframes, save_as_stack=False, custom_headers=None, custom_filename=None
+    ):
+        """Setup capture parameters before running thread"""
+        self.nframes = nframes
+        self.save_as_stack = save_as_stack
+        self.custom_headers = custom_headers or {}
+        self.custom_filename = custom_filename
+
+    def run(self):
+        """Run capture in separate thread"""
+        try:
+            # Initialize capture state in parent
+            self.parent.is_capturing = True
+            self.parent.capture_start_time = time.time()
+            self.parent.total_frames = self.nframes
+            self.parent.current_frame = 0
+            self.parent.current_exposure_time = self.parent.exp_input.value()
+
+            self.parent.CL.SerialClose()
+
+            # Initialize list for stacking if needed
+            image_stack = []
+            stack_headers = []
+            stack_filename = None
+
+            for i in range(self.nframes):
+                self.parent.current_frame = i + 1
+                self.parent.frame_start_time = time.time()
+
+                self.status_update.emit(
+                    f"Status: Waiting for frame {i+1}/{self.nframes}..."
+                )
+                self.frame_captured.emit(i + 1, self.nframes)
+
+                # Capture logic
+                # Replace the SINGLE trigger mode section with this:
+
+                if self.trigmode is TrigMode.SINGLE:
+                    CirAq = None
+                    try:
+                        # 1) Setup camera for single-shot INT mode
+                        self.parent.setup_serial()
+                        self.parent.send_command("SENS:TRIG:MODE INT")
+                        time.sleep(0.05)
+                        self.parent.send_command("SENS:TRIG OFF")
+                        time.sleep(0.10)
+                        self.parent.send_command("SENS:TRIG:COUNT 1")
+                        time.sleep(0.05)
+
+                        # Query baseline state
+                        cnt0 = self.parent.query_scalar("SENS:TRIG:COUNT?")
+                        sent0 = self.parent.query_scalar("SENS:TRIG:SENT?")
+                        self.parent.print_terminal(
+                            f"[single] COUNT baseline: {cnt0}, SENT baseline: {sent0}"
+                        )
+
+                        # 2) Close serial and arm the frame grabber FIRST
+                        self.parent.CL.SerialClose()
+
+                        CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                        CirAq.Open(0)
+                        numbuffers = 3
+                        BufArr = CirAq.BufferSetup(numbuffers)
+                        CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                        CirAq.AqControl(
+                            Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                        )
+                        time.sleep(0.05)
+
+                        # 3) Fire the trigger
+                        self.parent.setup_serial()
+                        self.parent.send_command("SENS:TRIG ON")
+                        t_start = time.time()
+                        self.parent.CL.SerialClose()
+
+                        # Get expected timing
+                        exp_s = float(self.parent.current_exposure_time or 0.0)
+                        expected_time = exp_s + 1.0
+
+                        self.parent.print_terminal(
+                            f"[single] Trigger fired at t=0. Exposure: {exp_s:.1f}s, "
+                            f"expected completion: ~{expected_time:.1f}s"
+                        )
+
+                        # 4) Wait for frame with BitFlow timeout workaround
+                        # BitFlow WaitForFrame has ~9-10s internal timeout, so we loop
+                        framearr = False
+                        curBuf = None
+                        bufnum = None
+
+                        # Use 8s waits (under the BitFlow ~9-10s limit)
+                        wait_chunk_ms = 8000
+                        max_wait_time = expected_time + 15.0  # Total deadline
+                        absolute_deadline = t_start + max_wait_time
+
+                        reinit_count = 0
+                        max_reinits = 5
+
+                        while not framearr and time.time() < absolute_deadline:
+                            elapsed = time.time() - t_start
+                            remaining = absolute_deadline - time.time()
+
+                            # Calculate this iteration's wait time
+                            wait_ms = min(wait_chunk_ms, int(remaining * 1000))
+                            if wait_ms < 100:
+                                break
+
+                            try:
+                                curBuf = CirAq.WaitForFrame(wait_ms)
+                                framearr = True
+                                bufnum = curBuf.BufferNumber
+
+                            except Buf.PythonMemException:
+                                elapsed = time.time() - t_start
+
+                                # Check if camera has finished exposing
+                                try:
+                                    self.parent.setup_serial()
+                                    cur_sent = self.parent.query_scalar(
+                                        "SENS:TRIG:SENT?"
+                                    )
+                                    self.parent.CL.SerialClose()
+
+                                    camera_done = (
+                                        cur_sent
+                                        and sent0
+                                        and int(cur_sent) > int(sent0)
+                                    )
+
+                                    if camera_done and elapsed > expected_time:
+                                        # Camera finished but no frame - grabber issue
+                                        self.parent.print_terminal(
+                                            f"[single] t={elapsed:.1f}s: Camera done (SENT={cur_sent}), "
+                                            f"but no frame. Reinitializing grabber..."
+                                        )
+
+                                        # Reinit grabber to try to get the frame
+                                        try:
+                                            CirAq.AqCleanup()
+                                            CirAq.BufferCleanup()
+                                            CirAq.Close()
+                                        except:
+                                            pass
+
+                                        reinit_count += 1
+                                        if reinit_count >= max_reinits:
+                                            raise TimeoutError(
+                                                f"Camera exposed (SENT={cur_sent}) but frame never arrived "
+                                                f"after {reinit_count} grabber reinits. Check Camera Link cable."
+                                            )
+
+                                        CirAq = Buf.clsCircularAcquisition(
+                                            Buf.ErrorMode.ErIgnore
+                                        )
+                                        CirAq.Open(0)
+                                        BufArr = CirAq.BufferSetup(numbuffers)
+                                        CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                                        CirAq.AqControl(
+                                            Buf.AcqCommands.Start,
+                                            Buf.AcqControlOptions.Wait,
+                                        )
+                                        time.sleep(0.05)
+
+                                    elif elapsed < expected_time:
+                                        # Still exposing - just continue waiting
+                                        self.parent.print_terminal(
+                                            f"[single] t={elapsed:.1f}s: Still exposing (SENT={cur_sent})..."
+                                        )
+                                    else:
+                                        # Past expected time but SENT hasn't incremented
+                                        self.parent.print_terminal(
+                                            f"[single] t={elapsed:.1f}s: Past expected time but SENT={cur_sent}, "
+                                            "continuing to wait..."
+                                        )
+
+                                except Exception as e:
+                                    self.parent.print_terminal(
+                                        f"[single] Status check error: {e}"
+                                    )
+                                    # Continue waiting even if status check fails
+                                    continue
+
+                        # Check if we got the frame
+                        if not framearr or curBuf is None:
+                            elapsed = time.time() - t_start
+
+                            # Final diagnostics
+                            try:
+                                self.parent.setup_serial()
+                                sent_final = self.parent.query_scalar("SENS:TRIG:SENT?")
+                                trig_final = self.parent.query_scalar("SENS:TRIG?")
+                                self.parent.CL.SerialClose()
+
+                                error_msg = (
+                                    f"No frame after {elapsed:.1f}s (expected ~{expected_time:.1f}s). "
+                                    f"SENT: {sent0}→{sent_final}, TRIG: {trig_final}"
+                                )
+
+                                if (
+                                    sent_final
+                                    and sent0
+                                    and int(sent_final) > int(sent0)
+                                ):
+                                    error_msg += ". Camera exposed but frame lost - check Camera Link connection."
+                                else:
+                                    error_msg += (
+                                        ". Camera may not have triggered properly."
+                                    )
+
+                                raise TimeoutError(error_msg)
+
+                            except TimeoutError:
+                                raise
+                            except Exception as e:
+                                raise TimeoutError(
+                                    f"No frame after {elapsed:.1f}s and diagnostics failed: {e}"
+                                )
+
+                        # 5) Success!
+                        total_time = time.time() - t_start
+                        self.parent.last_exposure_duration = total_time
+
+                        self.parent.print_terminal(
+                            f"[single] Frame received! Actual time: {total_time:.2f}s "
+                            f"(expected ~{expected_time:.1f}s)"
+                        )
+
+                        img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
+
+                        # 6) Verify SENT
+                        try:
+                            self.parent.setup_serial()
+                            sent_final = self.parent.query_scalar("SENS:TRIG:SENT?")
+                            self.parent.CL.SerialClose()
+
+                            self.parent.print_terminal(
+                                f"[single] SENT: {sent0} → {sent_final}"
+                            )
+
+                            if sent0 is not None and sent_final is not None:
+                                if int(sent_final) <= int(sent0):
+                                    self.parent.print_terminal(
+                                        "[single] WARNING: SENT did not increment!"
+                                    )
+
+                        except Exception as e:
+                            self.parent.print_terminal(
+                                f"[single] SENT check failed: {e}"
+                            )
+
+                    finally:
+                        # 7) Cleanup
+                        try:
+                            self.parent.setup_serial()
+                            self.parent.send_command("SENS:TRIG OFF")
+                            self.parent.CL.SerialClose()
+                            self.parent.print_terminal("[single] Trigger disabled")
+                        except Exception as e:
+                            self.parent.print_terminal(
+                                f"[single] Cleanup TRIG OFF failed: {e}"
+                            )
+
+                        if CirAq is not None:
+                            try:
+                                CirAq.AqCleanup()
+                                CirAq.BufferCleanup()
+                                CirAq.Close()
+                            except Exception as e:
+                                self.parent.print_terminal(
+                                    f"[single] Cleanup grabber failed: {e}"
+                                )
+
+                # STREAM trigger mode logic:
+                else:
+                    CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                    CirAq.Open(0)
+                    numbuffers = 3
+                    BufArr = CirAq.BufferSetup(numbuffers)
+                    CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                    CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
+
+                    framearr = False
+                    t0 = time.time()
+                    self.parent.print_terminal(
+                        f"Starting recording {i+1}/{self.nframes} .."
+                    )
+
+                    while not framearr:
+                        try:
+                            curBuf = CirAq.WaitForFrame(5000)
+                        except Buf.PythonMemException:
+                            self.parent.print_terminal("Waiting for frame arrival")
+                            CirAq.AqCleanup()
+                            CirAq.BufferCleanup()
+                            CirAq.Close()
+
+                            CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
+                            CirAq.Open(0)
+                            BufArr = CirAq.BufferSetup(numbuffers)
+                            CirAq.AqSetup(Buf.SetupOptions.setupDefault)
+                            CirAq.AqControl(
+                                Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait
+                            )
+                            continue
+                        else:
+                            framearr = True
+                            bufnum = curBuf.BufferNumber
+                            t1 = time.time()
+
+                    total_time = t1 - t0
+                    self.parent.print_terminal(
+                        f"Total acquisition time: {total_time:.2f} seconds"
+                    )
+
+                    img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
+                    CirAq.AqCleanup()
+                    CirAq.BufferCleanup()
+                    CirAq.Close()
+
+                # Store the actual exposure duration
+                self.parent.last_exposure_duration = total_time
+
+                self.parent.print_terminal(
+                    f"[single] Frame received! Total time: {total_time:.2f}s"
+                )
+
+                # Create FITS header and save
+                now = datetime.now(timezone.utc).replace(microsecond=0)
+                curtime = now.strftime("%Y%m%dT%H%M%S")
+                folder = self.parent.save_path_input.text().strip()
+                os.makedirs(folder, exist_ok=True)
+
+                # Create header
+                hdr = fits.Header()
+                mjd = now.timestamp() / 86400.0 + 40587
+                hdr["MJD-OBS"] = (mjd, "Modified Julian Date of observation")
+
+                object_name = self.parent.object_input.text().strip()
+                observer_name = self.parent.observer_input.text().strip()
+                if object_name:
+                    hdr["OBJECT"] = (object_name, "Object name")
+                if observer_name:
+                    hdr["OBSERVER"] = (observer_name, "Observer name")
+
+                hdr["TRIGMODE"] = (self.trigmode.value, "Acquisition trigger mode")
+
+                # Add last exposure duration if available
+                if self.parent.last_exposure_duration is not None:
+                    hdr["AEXPTIME"] = (
+                        round(self.parent.last_exposure_duration, 3),
+                        "Actual exposure duration (s)",
+                    )
+
+                # Query camera parameters
+                CLOCK_FREQ_MHZ = 15.0
+                queries = {
+                    "EXPTIME": ("SENS:EXPPER?", "Exposure time (s)"),
+                    "FRMTIME": ("SENS:FRAMEPER?", "Frame period (s)"),
+                    "CLKFREQ": ("SENS:CLOCKFREQ?", "Clock frequency"),
+                    "XSIZE": ("SENS:XSIZE?", "Horizontal ROI size"),
+                    "YSIZE": ("SENS:YSIZE?", "Vertical ROI size"),
+                    "XSTART": ("SENS:XSTART?", "Horizontal ROI start"),
+                    "YSTART": ("SENS:YSTART?", "Vertical ROI start"),
+                    "TMP_SET": ("TEMP:SENS:SET?", "Sensor temp setpoint"),
+                    "TMP_CUR": ("TEMP:SENS?", "Sensor temp (C)"),
+                    "TEC_EN": ("TEC:EN?", "TEC enabled"),
+                    "TEC_LOCK": ("TEC:LOCK?", "TEC locked"),
+                    "FORMAT": ("DATA:FORMAT?", "Data format"),
+                    "GAINCOR": ("CORR:GAIN?", "Gain corr. enabled"),
+                    "OFFCOR": ("CORR:OFFSET?", "Offset corr. enabled"),
+                    "SUBCOR": ("CORR:SUB?", "Pixel subst. enabled"),
+                    "SOCNAME": ("SOC?", "Current SOC"),
+                    "MODEL": ("SYS:MODEL?", "Model"),
+                    "SERIAL": ("SYS:SN?", "Serial number"),
+                    "FWVERS": ("SYS:FW?", "Firmware version"),
+                    "SWVERS": ("SYS:SW?", "Software version"),
+                }
+
+                self.parent.setup_serial()
+                time.sleep(0.2)
+                for key, (cmd, comment) in queries.items():
+                    val = self.parent.query_scalar(cmd)
+                    if val is not None and not val.startswith(cmd):
+                        try:
+                            if key in ["EXPTIME", "FRMTIME"] and val.isdigit():
+                                val = int(val)
+                                val = val / (CLOCK_FREQ_MHZ * 1e6)
+                                val = np.round(val, 3)
+                            elif key == "CLKFREQ":
+                                val = float(val.strip("MHZmhz")) * 1e6
+                            elif key in ["XSIZE", "YSIZE", "XSTART", "YSTART"]:
+                                val = int(val)
+                            elif key in ["TMP_CUR", "TMP_SET"]:
+                                val = float(val)
+                            elif key in [
+                                "TEC_EN",
+                                "TEC_LOCK",
+                                "GAINCOR",
+                                "OFFCOR",
+                                "SUBCOR",
+                            ]:
+                                val = 1 if val.upper() == "ON" else 0
+                            else:
+                                val = val.strip()
+                            hdr[key] = (val, comment)
+                        except Exception as e:
+                            self.parent.print_terminal(
+                                f"Error converting {key} with value '{val}': {e}"
+                            )
+
+                # Add custom headers
+                if self.custom_headers:
+                    self.parent._add_custom_headers(hdr, self.custom_headers)
+
+                # Add frame-specific info for stacks
+                if self.save_as_stack:
+                    hdr["FRAME"] = (i + 1, "Frame number in stack")
+                    hdr["DATEOBS"] = (now.isoformat(), "Date-time of this frame")
+
+                self.parent.CL.SerialClose()
+
+                # Save based on mode
+                if self.save_as_stack:
+                    # Store for stack
+                    image_stack.append(img)
+                    stack_headers.append(hdr)
+                    if i == 0:
+                        if self.custom_filename:
+                            base_filename = self.custom_filename
+                            if not base_filename.endswith(".fits"):
+                                base_filename += ".fits"
+                            stack_filename = os.path.join(folder, base_filename)
+                        else:
+                            stack_filename = os.path.join(
+                                folder, "scicam_stack_" + curtime + ".fits"
+                            )
+                    self.status_update.emit(
+                        f"Collected frame {i+1}/{self.nframes} for stack"
+                    )
+                    # Send image for display
+                    self.image_ready.emit(img)
+                else:
+                    # Save individual file
+                    if self.custom_filename and self.nframes == 1:
+                        base_filename = self.custom_filename
+                        if not base_filename.endswith(".fits"):
+                            base_filename += ".fits"
+                        filename = os.path.join(folder, base_filename)
+                    else:
+                        filename = os.path.join(folder, "scicam_" + curtime + ".fits")
+
+                    hdu = fits.PrimaryHDU(img, header=hdr)
+                    hdu.writeto(filename, overwrite=True)
+                    self.status_update.emit(f"Saved: {filename}")
+
+                    # Send notification
+                    notification = {
+                        "event": "frame_saved",
+                        "filename": filename,
+                        "frame": i + 1,
+                        "total_frames": self.nframes,
+                    }
+                    self.notification.emit(notification)
+
+                    # Send image for display
+                    self.image_ready.emit(img)
+
+                if i == self.nframes - 1:
+                    self.parent.setup_serial()
+                    time.sleep(0.2)
+
+            # If stacking, save the stack now
+            if self.save_as_stack and image_stack:
+                self.parent.print_terminal(
+                    f"Saving stack of {len(image_stack)} frames..."
+                )
+
+                # Create 3D array
+                data_cube = np.array(image_stack, dtype=np.uint16)
+
+                # Create FITS with stack
+                primary_hdr = stack_headers[0].copy()
+                primary_hdr["NAXIS"] = 3
+                primary_hdr["NAXIS3"] = len(image_stack)
+                primary_hdr["NFRAMES"] = (len(image_stack), "Number of frames in stack")
+                primary_hdr["STACKTYP"] = ("TEMPORAL", "Type of stack")
+
+                primary_hdu = fits.PrimaryHDU(data_cube, header=primary_hdr)
+                hdul = fits.HDUList([primary_hdu])
+
+                # Add frame metadata
+                for idx, hdr in enumerate(stack_headers):
+                    col1 = fits.Column(name="FRAME", format="I", array=[idx + 1])
+                    col2 = fits.Column(
+                        name="MJD_OBS", format="D", array=[hdr["MJD-OBS"]]
+                    )
+                    cols = fits.ColDefs([col1, col2])
+                    tbhdu = fits.BinTableHDU.from_columns(cols)
+                    tbhdu.header["EXTNAME"] = f"FRAME{idx+1}"
+                    for key in ["MJD-OBS", "TMP_CUR", "DATEOBS"]:
+                        if key in hdr:
+                            tbhdu.header[key] = hdr[key]
+                    hdul.append(tbhdu)
+
+                hdul.writeto(stack_filename, overwrite=True)
+                hdul.close()
+
+                self.status_update.emit(f"Saved stack: {stack_filename}")
+                self.parent.print_terminal(f"Stack saved: {stack_filename}")
+
+                # Send notification
+                notification = {
+                    "event": "stack_saved",
+                    "filename": stack_filename,
+                    "frames": len(image_stack),
+                    "total_frames": self.nframes,
+                }
+                self.notification.emit(notification)
+
+            self.capture_complete.emit()
+
+        except Exception as e:
+            self.capture_error.emit(str(e))
+            self.parent.print_terminal(f"Capture error: {e}")
+
+
+class CameraState(Enum):
+    READY = auto()
+    SETTING_EXPOSURE = auto()
+    TEC_SETTLING = auto()
+    EXPOSING = auto()
+    ERROR = auto()
 
 
 class SciCamGUI(QWidget):
     waiting_on_exposure_update = False
 
-    def __init__(self, enable_server=True, server_port=5555):
+    def __init__(
+        self, enable_server=True, server_port=5555, trigmode: TrigMode = TrigMode.SINGLE
+    ):
         super().__init__()
+        self.trigmode = trigmode
         self.setWindowTitle("PIRT Control Panel")
-        self.setGeometry(100, 100, 600, 500)
+        self.setGeometry(100, 100, 600, 550)  # Slightly taller for progress bar
         self.setup_ui()
         self.setup_serial()
 
         self.exp_input.blockSignals(True)
-        self.exp_input.setValue(1.0)  # GUI default only, no serial write
+        self.exp_input.setValue(1.0)
+        self.exp_input.blockSignals(False)
+
+        # Query current exposure time from camera and update the display value
+        self.exp_input.blockSignals(True)
+        current_exp_str = self.query_scalar("SENS:EXPPER?")
+        if current_exp_str:
+            try:
+                CLOCK_FREQ = 15.0
+                current_cycles = int(current_exp_str)
+                current_exp_seconds = current_cycles / (CLOCK_FREQ * 1e6)
+                self.exp_input.setValue(current_exp_seconds)
+                self.print_terminal(
+                    f"Current camera exposure: {current_exp_seconds:.6f}s"
+                )
+            except ValueError:
+                self.print_terminal(
+                    f"Could not parse exposure cycles: {current_exp_str}, using default 1.0s"
+                )
+                self.exp_input.setValue(1.0)
+        else:
+            self.print_terminal(
+                "Could not read exposure from camera, using default 1.0s"
+            )
+            self.exp_input.setValue(1.0)
         self.exp_input.blockSignals(False)
 
         self.state = {}
 
+        # Enum to track the camera gui state
+        self.camera_state = CameraState.READY
+
+        # Add capture tracking variables
+        self.is_capturing = False
+        self.capture_start_time = None
+        self.current_frame = 0
+        self.total_frames = 0
+        self.frame_start_time = None
+        self.current_exposure_time = 0.0
+        self.last_exposure_duration = None  # Track actual exposure time
+        self.serial_error_count = 0  # Track consecutive serial errors
+        self.max_serial_errors = 3  # Max errors before attempting reconnect
+
+        # Initialize capture thread
+        self.capture_thread = CaptureThread(parent=self, trigmode=self.trigmode)
+        self.capture_thread.status_update.connect(self.on_capture_status_update)
+        self.capture_thread.frame_captured.connect(self.on_frame_captured)
+        self.capture_thread.capture_complete.connect(self.on_capture_complete)
+        self.capture_thread.capture_error.connect(self.on_capture_error)
+        self.capture_thread.image_ready.connect(self.on_image_ready)
+        self.capture_thread.notification.connect(self.send_notification)
+
         self.update_status_indicators()
+
+        # Slow timer for status queries (5 seconds)
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status_indicators)
         self.status_timer.start(5000)
+
+        # Fast timer for time updates (0.5 seconds)
+        self.time_update_timer = QTimer()
+        self.time_update_timer.timeout.connect(self.update_time_fields)
+        self.time_update_timer.start(500)  # 2Hz update rate
 
         # Disable capture button until TEC is locked
         self.capture_button.setEnabled(False)
@@ -237,31 +932,41 @@ class SciCamGUI(QWidget):
             response = {"status": "error", "message": "Unknown command"}
 
             if cmd_type == "CAPTURE":
-                # Capture frame(s)
                 nframes = cmd_data.get("nframes", 1)
                 self.nframes_input.setText(str(nframes))
 
-                # Store custom headers and stack mode for capture
                 self.custom_headers = cmd_data.get("headers", {})
                 self.save_as_stack = cmd_data.get("stack", False)
                 self.custom_filename = cmd_data.get("filename", None)
 
-                # Check if TEC is locked
                 if not self.capture_button.isEnabled():
                     response = {"status": "error", "message": "TEC not locked"}
-                else:
-                    # Send immediate response before starting capture
-                    response = {
-                        "status": "success",
-                        "message": f"Starting capture of {nframes} frame(s)",
-                    }
                     if self.command_server:
-                        self.command_server.send_response(json.dumps(response))
+                        self.command_server.send_response(json.dumps(response) + "\n")
+                    return
 
-                    # Trigger capture (notifications will be sent as frames are saved)
-                    self.capture_frame()
-                    return  # Don't send response again at the end
+                # Immediate ACK before starting the long/async work
+                ack = {
+                    "status": "success",
+                    "message": f"Starting capture of {nframes} frame(s)",
+                }
+                if self.command_server:
+                    # Log and send with a newline so line-based clients can read a frame
+                    self.print_terminal(
+                        f"Sending response: {ack['status']} - {ack.get('message','')}"
+                    )
+                    try:
+                        self.command_server.send_response(json.dumps(ack) + "\n")
+                    except Exception as e:
+                        self.print_terminal(f"Failed to send ACK: {e}")
+                        return  # don't proceed if we can't talk to the client
 
+                self.print_terminal("Starting capture from remote command...")
+
+                # Defer the actual capture so the socket write can flush
+                QTimer.singleShot(0, self.capture_frame)
+
+                return  # don't fall through to the common send-response block
             elif cmd_type == "SET_EXPOSURE":
                 # Set exposure time
                 exp_time = cmd_data.get("exposure", 1.0)
@@ -351,26 +1056,47 @@ class SciCamGUI(QWidget):
                 }
 
             elif cmd_type == "SET_PATH":
-                # Set save path
-                path = cmd_data.get("path", "")
-                if path:
-                    # Expand user paths like ~/data
-                    # path = os.path.expanduser(path)
-                    # Create directory if it doesn't exist
+                raw_path = cmd_data.get("path")
+
+                if (
+                    not raw_path
+                    or not isinstance(raw_path, str)
+                    or not raw_path.strip()
+                ):
+                    response = {"status": "error", "message": "No path provided"}
+                else:
+                    display_path = raw_path  # keep exactly what user entered for the UI
                     try:
-                        os.makedirs(path, exist_ok=True)
-                        self.save_path_input.setText(path)
+                        # Expand ~ and any environment variables, then normalize
+                        expanded = os.path.expandvars(os.path.expanduser(raw_path))
+                        if not expanded.strip():
+                            raise ValueError("Path resolves to an empty string")
+
+                        p = Path(expanded)
+
+                        # If something exists there and it's not a directory, fail early
+                        if p.exists() and not p.is_dir():
+                            raise NotADirectoryError(
+                                f"Path exists and is not a directory: {p}"
+                            )
+
+                        # Create directory and any missing parents
+                        p.mkdir(parents=True, exist_ok=True)
+
+                        # Show the original (unexpanded) path in the UI
+                        self.save_path_input.setText(display_path)
+
                         response = {
                             "status": "success",
-                            "message": f"Save path set to {path}",
+                            "message": f"Save path set to {display_path}",
+                            # Optionally include the resolved path for callers/logging
+                            "resolved_path": str(p),
                         }
                     except Exception as e:
                         response = {
                             "status": "error",
-                            "message": f"Failed to create directory: {str(e)}",
+                            "message": f"Failed to create directory '{display_path}': {e}",
                         }
-                else:
-                    response = {"status": "error", "message": "No path provided"}
 
             elif cmd_type == "SET_FILENAME":
                 # Set custom filename for next capture
@@ -405,13 +1131,26 @@ class SciCamGUI(QWidget):
                     "gain_corr": self.state.get("gain_corr", default),
                     "offset_corr": self.state.get("offset_corr", default),
                     "sub_corr": self.state.get("sub_corr", default),
-                    "tec_lock": self.state.get("tec_lock", default),
                     "tec_enabled": self.state.get("tec_enabled", default),
                     "tec_voltage": self.state.get("tec_voltage", default),
                     "case_temp": self.state.get("case_temp", default),
                     "digpcb_temp": self.state.get("digpcb_temp", default),
                     "senspcb_temp": self.state.get("senspcb_temp", default),
                     "waiting_on_exposure_update": int(self.waiting_on_exposure_update),
+                    "ready": self.state.get("ready", False),
+                    "timeout_remaining": self.state.get("timeout_remaining", 0.0),
+                    "is_capturing": self.state.get("is_capturing", False),
+                    "current_frame": self.state.get("current_frame", 0),
+                    "total_frames": self.state.get("total_frames", 0),
+                    "capture_time_remaining": self.state.get(
+                        "capture_time_remaining", 0.0
+                    ),
+                    "camera_state": self.camera_state.name,
+                    "trigmode": self.trigmode.value,
+                    "last_exposure_duration": self.state.get(
+                        "last_exposure_duration", None
+                    ),
+                    "serial_error_count": self.serial_error_count,
                 }
                 response = {"status": "success", "data": status}
 
@@ -480,132 +1219,316 @@ class SciCamGUI(QWidget):
             response = {"status": "error", "message": "Invalid JSON command"}
             if self.command_server:
                 self.command_server.send_response(json.dumps(response))
+            import traceback
+
+            self.print_terminal(f"Error processing command: {traceback.format_exc()}")
         except Exception as e:
             response = {"status": "error", "message": str(e)}
             if self.command_server:
                 self.command_server.send_response(json.dumps(response))
             self.print_terminal(f"Error processing command: {e}")
 
-    def update_status_indicators(self):
-        setpoint = self.query_scalar("TEMP:SENS:SET?")
+    def update_time_fields(self):
+        """Fast update for time-based fields only"""
+        # Calculate ready status
+        tec_locked = self.state.get("tec_lock", 0) == 1
 
-        if setpoint:
-            try:
-                setpoint = float(setpoint)
-            except Exception:
-                setpoint = -888.0
-            self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
+        # Check what CameraState we are in
+        if self.is_capturing:
+            self.camera_state = CameraState.EXPOSING
+        elif self.waiting_on_exposure_update:
+            self.camera_state = CameraState.SETTING_EXPOSURE
+        elif tec_locked:
+            self.camera_state = CameraState.READY
+        else:
+            # TEC is not locked
+            self.camera_state = CameraState.TEC_SETTLING
 
-        self.state.update({"tec_setpoint": setpoint})
+        self.state.update({"camera_state": self.camera_state.name})
 
-        temp = self.query_scalar("TEMP:SENS?")
-        if temp:
-            try:
-                temp = float(temp)
-            except Exception:
-                temp = -888.0
-            self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
-        self.state.update({"tec_temp": temp})
+        # Update the GUI:
+        # Update camera state label
+        self.camera_state_label.setText(f"State: {self.camera_state.name}")
+        # Color code the state
+        if self.camera_state == CameraState.READY:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: green;")
+        elif self.camera_state == CameraState.SETTING_EXPOSURE:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: orange;")
+        elif self.camera_state == CameraState.EXPOSING:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: blue;")
+        elif self.camera_state == CameraState.TEC_SETTLING:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: purple;")
+        elif self.camera_state == CameraState.ERROR:
+            self.camera_state_label.setStyleSheet("font-weight: bold; color: red;")
 
-        soc = self.query_scalar("SOC?")
-        self.state.update({"soc": soc})
-        if soc:
-            self.soc_label.setText(f"Loaded SOC: {soc}")
+        is_ready = (
+            not self.waiting_on_exposure_update and tec_locked and not self.is_capturing
+        )
+        self.state.update({"ready": is_ready})
 
-        gain = self.query_scalar("CORR:GAIN?")
-        if gain:
-            self.gaincor_dropdown.setCurrentText(gain.strip().upper())
-            if gain.lower() == "on":
-                gain = 1
-            elif gain.lower() == "off":
-                gain = 0
+        # Calculate timeout remaining for exposure update
+        timeout_remaining = 0.0
+        if self.waiting_on_exposure_update and hasattr(self, "exposure_wait_end_time"):
+            timeout_remaining = max(0.0, self.exposure_wait_end_time - time.time())
+        self.state.update({"timeout_remaining": timeout_remaining})
+
+        # Update capture/exposure status
+        self.state.update({"is_capturing": self.is_capturing})
+        self.state.update({"current_frame": self.current_frame})
+        self.state.update({"total_frames": self.total_frames})
+
+        # Calculate capture time remaining
+        capture_time_remaining = 0.0
+        exposure_time_remaining = 0.0
+
+        if self.is_capturing:
+            if self.frame_start_time:
+                frame_elapsed = time.time() - self.frame_start_time
+                expected_frame_time = self.current_exposure_time + 2.0
+                frame_remaining = max(0.0, expected_frame_time - frame_elapsed)
+
+                # Calculate exposure time remaining (without overhead)
+                exposure_time_remaining = max(
+                    0.0, self.current_exposure_time - frame_elapsed
+                )
             else:
-                gain = None
-        self.state.update({"gain_corr": gain})
+                frame_remaining = self.current_exposure_time + 2.0
+                exposure_time_remaining = self.current_exposure_time
 
-        off = self.query_scalar("CORR:OFFSET?")
-        if off:
-            self.offcor_dropdown.setCurrentText(off.strip().upper())
-            if off.lower() == "on":
-                off = 1
-            elif off.lower() == "off":
-                off = 0
-            else:
-                off = None
-        self.state.update({"offset_corr": off})
+            frames_left = self.total_frames - self.current_frame
+            remaining_frames_time = frames_left * (self.current_exposure_time + 2.0)
+            capture_time_remaining = frame_remaining + remaining_frames_time
 
-        sub = self.query_scalar("CORR:SUB?")
-        if sub:
-            self.subcor_dropdown.setCurrentText(sub.strip().upper())
-            if sub.lower() == "on":
-                sub = 1
-            elif sub.lower() == "off":
-                sub = 0
-            else:
-                sub = None
-        self.state.update({"sub_corr": sub})
+            # Update progress bar for exposure time
+            if self.current_exposure_time > 0:
+                # Calculate elapsed time
+                exposure_elapsed = self.current_exposure_time - exposure_time_remaining
 
-        tec_lock = self.query_scalar("TEC:LOCK?")
+                # Set maximum to exposure time in tenths of seconds for smooth animation
+                max_val = int(self.current_exposure_time * 10)
+                current_val = int(exposure_elapsed * 10)
+                self.capture_progress.setMaximum(max_val)
+                self.capture_progress.setValue(current_val)
+                self.capture_progress.setFormat(
+                    f"Exposure: {exposure_time_remaining:.1f}s remaining"
+                )
+        else:
+            # Reset progress bar when not capturing
+            self.capture_progress.setValue(0)
+            self.capture_progress.setFormat("Exposure: Idle")
 
-        if tec_lock and tec_lock.strip().upper() == "ON":
-            self.tec_lock_light.setStyleSheet(
+        self.state.update({"capture_time_remaining": capture_time_remaining})
+
+        # Update last exposure duration display
+        if self.last_exposure_duration is not None:
+            self.last_exposure_label.setText(
+                f"Last Exposure: {self.last_exposure_duration:.2f}s"
+            )
+            self.state.update({"last_exposure_duration": self.last_exposure_duration})
+        else:
+            self.last_exposure_label.setText("Last Exposure: N/A")
+            self.state.update({"last_exposure_duration": None})
+
+        # Update visual indicators
+        if is_ready:
+            self.ready_light.setStyleSheet(
                 "background-color: green; border-radius: 8px;"
             )
-            self.capture_button.setEnabled(True)
-            tec_lock_status = 1
         else:
-            self.tec_lock_light.setStyleSheet(
-                "background-color: red; border-radius: 8px;"
+            self.ready_light.setStyleSheet(
+                "background-color: yellow; border-radius: 8px;"
             )
-            self.capture_button.setEnabled(False)
-            tec_lock_status = 0
-        self.state.update({"tec_lock": tec_lock_status})
 
-        # TEC Voltage
-        tec_voltage = self.query_scalar("TEC:V?")
-        if tec_voltage:
-            try:
-                tec_voltage = float(tec_voltage)
-            except Exception:
-                tec_voltage = -888.0
-        self.state.update({"tec_voltage": tec_voltage})
-
-        # Case Temperature
-        case_temp = self.query_scalar("TEMP:CASE?")
-        if case_temp:
-            try:
-                case_temp = float(case_temp)
-            except Exception:
-                case_temp = -888.0
-        self.state.update({"case_temp": case_temp})
-
-        # DIGPCB Temperature
-        digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
-        if digpcb_temp:
-            try:
-                digpcb_temp = float(digpcb_temp)
-            except Exception:
-                digpcb_temp = -888.0
-        self.state.update({"digpcb_temp": digpcb_temp})
-
-        # SENSPCB Temperature
-        senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
-        if senspcb_temp:
-            try:
-                senspcb_temp = float(senspcb_temp)
-            except Exception:
-                senspcb_temp = -888.0
-        self.state.update({"senspcb_temp": senspcb_temp})
-
-        # TEC Status (enabled/disabled)
-        tec_status = self.query_scalar("TEC:EN?")
-        if tec_status and tec_status.strip().upper() == "ON":
-            tec_enabled = 1
-        elif tec_status and tec_status.strip().upper() == "OFF":
-            tec_enabled = 0
+        # Update timeout label
+        if timeout_remaining > 0:
+            self.timeout_label.setText(f"Timeout: {timeout_remaining:.1f}s")
         else:
-            tec_enabled = None
-        self.state.update({"tec_enabled": tec_enabled})
+            self.timeout_label.setText("Timeout: N/A")
+
+        # Update capture status labels
+        if self.is_capturing:
+            self.capture_status_label.setText(
+                f"Capture: Frame {self.current_frame}/{self.total_frames}"
+            )
+            self.capture_progress_label.setText(
+                f"Total time remaining: {capture_time_remaining:.1f}s"
+            )
+        else:
+            self.capture_status_label.setText("Capture: Idle")
+            self.capture_progress_label.setText("Progress: N/A")
+
+    def on_capture_status_update(self, status):
+        """Handle status updates from capture thread"""
+        self.status_label.setText(status)
+
+    def on_frame_captured(self, current, total):
+        """Handle frame capture progress"""
+        self.current_frame = current
+        self.total_frames = total
+        self.frame_start_time = time.time()  # Reset timer for new frame's exposure
+        # Progress bar updates are now handled by update_time_fields()
+
+    def on_capture_complete(self):
+        """Handle capture completion"""
+        self.is_capturing = False
+        self.capture_start_time = None
+        self.current_frame = 0
+        self.total_frames = 0
+        self.frame_start_time = None
+        self.custom_headers = {}
+        self.save_as_stack = False
+        self.custom_filename = None
+        self.status_label.setText("Status: Idle")
+        self.capture_progress.setValue(0)
+
+    def on_capture_error(self, error_msg):
+        """Handle capture errors"""
+        self.print_terminal(f"Capture error: {error_msg}")
+        self.camera_state = CameraState.ERROR
+        self.state.update({"camera_state": self.camera_state.name})
+        self.on_capture_complete()  # Reset state
+        # Keep the state in error until next successful operation that is not GET_STATUS
+        # TODO:Add better handling of errors and thoughtful recovery
+
+    def on_image_ready(self, img):
+        """Handle new image for display"""
+        if hasattr(self, "viewer") and self.viewer:
+            self.viewer.update_image(img)
+            QApplication.processEvents()
+
+    def send_notification(self, notification):
+        """Send notification to TCP clients"""
+        if self.command_server:
+            self.command_server.send_response(json.dumps(notification))
+
+    def update_status_indicators(self):
+
+        # Skip all serial queries if we're currently capturing
+        if self.is_capturing:
+            self.print_terminal("Skipping status queries during exposure")
+            return
+        else:
+            # Query the camera status over the serial connection
+            setpoint = self.query_scalar("TEMP:SENS:SET?")
+
+            if setpoint:
+                try:
+                    setpoint = np.round(float(setpoint), 2)
+                except Exception:
+                    setpoint = -888.0
+                self.tec_setpoint_label.setText(f"Setpoint (°C): {setpoint}")
+
+            self.state.update({"tec_setpoint": setpoint})
+
+            temp = self.query_scalar("TEMP:SENS?")
+            if temp:
+                try:
+                    temp = np.round(float(temp), 2)
+                except Exception:
+                    temp = -888.0
+                self.dynamic_temp_label.setText(f"Temp (°C): {temp}")
+            self.state.update({"tec_temp": temp})
+
+            soc = self.query_scalar("SOC?")
+            self.state.update({"soc": soc})
+            if soc:
+                self.soc_label.setText(f"Loaded SOC: {soc}")
+
+            gain = self.query_scalar("CORR:GAIN?")
+            if gain:
+                self.gaincor_dropdown.setCurrentText(gain.strip().upper())
+                if gain.lower() == "on":
+                    gain = 1
+                elif gain.lower() == "off":
+                    gain = 0
+                else:
+                    gain = None
+            self.state.update({"gain_corr": gain})
+
+            off = self.query_scalar("CORR:OFFSET?")
+            if off:
+                self.offcor_dropdown.setCurrentText(off.strip().upper())
+                if off.lower() == "on":
+                    off = 1
+                elif off.lower() == "off":
+                    off = 0
+                else:
+                    off = None
+            self.state.update({"offset_corr": off})
+
+            sub = self.query_scalar("CORR:SUB?")
+            if sub:
+                self.subcor_dropdown.setCurrentText(sub.strip().upper())
+                if sub.lower() == "on":
+                    sub = 1
+                elif sub.lower() == "off":
+                    sub = 0
+                else:
+                    sub = None
+            self.state.update({"sub_corr": sub})
+
+            tec_lock = self.query_scalar("TEC:LOCK?")
+            tec_lock_status = 0  # Default to not locked
+
+            if tec_lock and tec_lock.strip().upper() == "ON":
+                self.tec_lock_light.setStyleSheet(
+                    "background-color: green; border-radius: 8px;"
+                )
+                self.capture_button.setEnabled(True)
+                tec_lock_status = 1
+            else:
+                self.tec_lock_light.setStyleSheet(
+                    "background-color: red; border-radius: 8px;"
+                )
+                self.capture_button.setEnabled(False)
+                tec_lock_status = 0
+            self.state.update({"tec_lock": tec_lock_status})
+
+            # TEC Voltage
+            tec_voltage = self.query_scalar("TEC:V?")
+            if tec_voltage:
+                try:
+                    tec_voltage = float(tec_voltage)
+                except Exception:
+                    tec_voltage = -888.0
+            self.state.update({"tec_voltage": tec_voltage})
+
+            # Case Temperature
+            case_temp = self.query_scalar("TEMP:CASE?")
+            if case_temp:
+                try:
+                    case_temp = np.round(float(case_temp), 2)
+                except Exception:
+                    case_temp = -888.0
+            self.state.update({"case_temp": case_temp})
+
+            # DIGPCB Temperature
+            digpcb_temp = self.query_scalar("TEMP:DIGPCB?")
+            if digpcb_temp:
+                try:
+                    digpcb_temp = np.round(float(digpcb_temp), 2)
+                except Exception:
+                    digpcb_temp = -888.0
+            self.state.update({"digpcb_temp": digpcb_temp})
+
+            # SENSPCB Temperature
+            senspcb_temp = self.query_scalar("TEMP:SENSPCB?")
+            if senspcb_temp:
+                try:
+                    senspcb_temp = np.round(float(senspcb_temp), 2)
+                except Exception:
+                    senspcb_temp = -888.0
+            self.state.update({"senspcb_temp": senspcb_temp})
+
+            # TEC Status (enabled/disabled)
+            tec_status = self.query_scalar("TEC:EN?")
+            if tec_status and tec_status.strip().upper() == "ON":
+                tec_enabled = 1
+            elif tec_status and tec_status.strip().upper() == "OFF":
+                tec_enabled = 0
+            else:
+                tec_enabled = None
+            self.state.update({"tec_enabled": tec_enabled})
 
     def setup_serial(self):
         self.CL = CLCom.clsCLAllSerial()
@@ -645,6 +1568,19 @@ class SciCamGUI(QWidget):
         tec_lock_row.addWidget(QLabel("TEC Lock:"))
         tec_lock_row.addWidget(self.tec_lock_light)
 
+        # Add ready status indicator
+        self.ready_light = QLabel()
+        self.ready_light.setFixedSize(16, 16)
+        self.ready_light.setStyleSheet("background-color: gray; border-radius: 8px;")
+        ready_row = QHBoxLayout()
+        ready_row.addWidget(QLabel("Ready:"))
+        ready_row.addWidget(self.ready_light)
+
+        # Add camera state label (add this after the ready indicator)
+        self.camera_state_label = QLabel("State: READY")
+        self.camera_state_label.setStyleSheet("font-weight: bold;")
+        labels_layout.addWidget(self.camera_state_label)
+
         labels_layout.addWidget(self.soc_label)
         labels_layout.addWidget(QLabel("Gain Corr:"))
         labels_layout.addWidget(self.gaincor_dropdown)
@@ -653,6 +1589,23 @@ class SciCamGUI(QWidget):
         labels_layout.addWidget(QLabel("Subst Corr:"))
         labels_layout.addWidget(self.subcor_dropdown)
         labels_layout.addLayout(tec_lock_row)
+        labels_layout.addLayout(ready_row)
+
+        # Add timeout remaining label
+        self.timeout_label = QLabel("Timeout: N/A")
+        labels_layout.addWidget(self.timeout_label)
+
+        # Add last exposure duration label
+        self.last_exposure_label = QLabel("Last Exposure: N/A")
+        labels_layout.addWidget(self.last_exposure_label)
+
+        # Add capture status indicators
+        self.capture_status_label = QLabel("Capture: Idle")
+        labels_layout.addWidget(self.capture_status_label)
+
+        self.capture_progress_label = QLabel("Progress: N/A")
+        labels_layout.addWidget(self.capture_progress_label)
+
         self.dynamic_temp_label = QLabel("Temp (°C): Unknown")
         labels_layout.addWidget(self.dynamic_temp_label)
 
@@ -714,9 +1667,7 @@ class SciCamGUI(QWidget):
 
         path_layout = QHBoxLayout()
         self.save_path_input = QLineEdit()
-        # Platform-independent home directory path
         default_folder = os.path.expanduser("~/data")
-        # Create directory if it doesn't exist
         os.makedirs(default_folder, exist_ok=True)
         self.save_path_input.setText(default_folder)
         path_layout.addWidget(self.save_path_input)
@@ -729,6 +1680,26 @@ class SciCamGUI(QWidget):
         self.capture_button = QPushButton("Capture Frame")
         self.capture_button.clicked.connect(self.capture_frame)
         layout.addWidget(self.capture_button)
+
+        # Add progress bar below capture button - configured for exposure time
+        self.capture_progress = QProgressBar()
+        self.capture_progress.setTextVisible(True)
+        self.capture_progress.setFormat("Exposure: Idle")
+        self.capture_progress.setStyleSheet(
+            """
+            QProgressBar {
+                text-align: center;
+                border: 1px solid grey;
+                border-radius: 3px;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+                border-radius: 2px;
+            }
+        """
+        )
+        layout.addWidget(self.capture_progress)
 
         self.status_label = QLabel("Status: Idle")
         layout.addWidget(self.status_label)
@@ -861,9 +1832,28 @@ class SciCamGUI(QWidget):
 
     def on_exposure_changed(self):
         """Handle exposure time changes from GUI"""
+        new_exp = self.exp_input.value()
+
+        # Check if exposure is actually changing
+        current_exp_str = self.query_scalar("SENS:EXPPER?")
+        if current_exp_str:
+            try:
+                CLOCK_FREQ = 15.0
+                current_cycles = int(current_exp_str)
+                current_exp_seconds = np.round(current_cycles / (CLOCK_FREQ * 1e6), 3)
+
+                # If exposure is within 0.001s of current, no need to change
+                if abs(current_exp_seconds - new_exp) < 0.001:
+                    self.print_terminal(
+                        f"Exposure already set to {new_exp}s, no change needed"
+                    )
+                    return True
+            except ValueError:
+                pass  # Continue with normal exposure setting if can't parse
+
+        # Proceed with exposure change
         self.waiting_on_exposure_update = True
         self.exposure_update_start_time = time.time()
-        new_exp = self.exp_input.value()
 
         # Use set_exposure method for consistency
         if not self.set_exposure(new_exp):
@@ -896,24 +1886,8 @@ class SciCamGUI(QWidget):
                 return
 
             self.send_command(f"TEMP:SENS:SET {target}")
-            """
-            # Old warmup procedure (now disabled)
-            # which enforces slow ramp.
-            # The idea is good but the implementation is bad and blocking.
-            # TODO: Re-implement with non-blocking approach
-            
-            if abs(current + 60.0) < 1.0 and target > -60:
-                for step in [-55, -50, -45]:
-                    if step > target:
-                        break
-                    self.print_terminal(f"Warming up: setting TEC to {step}°C")
-                    self.send_command(f"TEMP:SENS:SET {step}")
-                    self.wait_for_tec_lock(timeout_sec=300)
-            self.print_terminal(f"Final TEC setpoint: {target}°C")
-            self.send_command(f"TEMP:SENS:SET {target}")
-            """
         except Exception as e:
-            self.print_terminal(f"Error during TEC warm-up: {e}")
+            self.print_terminal(f"Error during TEC temperature change: {e}")
 
     def wait_for_tec_lock(self, timeout_sec=300):
         self.print_terminal("Waiting for TEC to lock...")
@@ -930,6 +1904,7 @@ class SciCamGUI(QWidget):
         self.print_terminal("WARNING: TEC failed to lock within timeout.")
 
     def query_scalar(self, command):
+        """Query camera with automatic serial reconnection on failure"""
         try:
             self.CL.SerialWrite(command + "\r", 100)
             time.sleep(0.05)
@@ -943,6 +1918,7 @@ class SciCamGUI(QWidget):
                         break
                 else:
                     time.sleep(0.05)
+
             lines = [line.strip() for line in output.splitlines() if line.strip()]
             values = [
                 line
@@ -950,11 +1926,63 @@ class SciCamGUI(QWidget):
                 if not line.startswith((">", command.split(":")[0], "ERROR"))
                 and line not in ("OK",)
             ]
+
             if values:
+                # Success - reset error count
+                self.serial_error_count = 0
                 return values[-1]
+            else:
+                # No response but no exception - might be communication issue
+                self.serial_error_count += 1
+                if self.serial_error_count >= self.max_serial_errors:
+                    self.print_terminal(
+                        f"Serial communication degraded ({self.serial_error_count} consecutive errors). "
+                        "Attempting reconnection..."
+                    )
+                    self.attempt_serial_reconnect()
+                return None
+
         except Exception as e:
+            self.serial_error_count += 1
             self.print_terminal(f"Error querying {command}: {e}")
-        return None
+
+            if self.serial_error_count >= self.max_serial_errors:
+                self.print_terminal(
+                    f"Multiple serial errors detected ({self.serial_error_count}). "
+                    "Attempting reconnection..."
+                )
+                self.attempt_serial_reconnect()
+            return None
+
+    def attempt_serial_reconnect(self):
+        """Attempt to reconnect serial communication"""
+        try:
+            self.print_terminal("Closing existing serial connection...")
+            try:
+                self.CL.SerialClose()
+            except:
+                pass  # Ignore errors when closing
+
+            time.sleep(0.5)  # Give port time to release
+
+            self.print_terminal("Re-initializing serial connection...")
+            self.setup_serial()
+
+            # Test the connection
+            test_response = self.query_scalar("SYS:MODEL?")
+            if test_response:
+                self.print_terminal("Serial reconnection successful!")
+                self.serial_error_count = 0
+                self.camera_state = CameraState.READY
+            else:
+                self.print_terminal(
+                    "Serial reconnection failed - no response from camera"
+                )
+                self.camera_state = CameraState.ERROR
+
+        except Exception as e:
+            self.print_terminal(f"Serial reconnection failed: {e}")
+            self.camera_state = CameraState.ERROR
 
     def enable_capture_button(self):
         """Re-enable capture button after exposure update completes"""
@@ -1011,33 +2039,11 @@ class SciCamGUI(QWidget):
             return True
 
     def capture_frame(self):
-        # Wait for exposure update if one is in progress
+        """Start capture in separate thread"""
+        # Wait for exposure update if needed
         if self.waiting_on_exposure_update:
-            self.print_terminal("Waiting for exposure update to complete...")
-
-            # Use the calculated wait time if available, otherwise default to 60 seconds
-            wait_timeout = (
-                getattr(self, "exposure_wait_time", 60.0) + 5.0
-            )  # Add 5s buffer
-            start_time = time.time()
-
-            while (
-                self.waiting_on_exposure_update
-                and (time.time() - start_time) < wait_timeout
-            ):
-                QApplication.processEvents()  # Keep GUI responsive
-                time.sleep(0.1)
-
-            if self.waiting_on_exposure_update:
-                self.print_terminal(
-                    f"ERROR: Exposure update timeout exceeded ({wait_timeout:.1f}s)"
-                )
-                # Force reset the flag to avoid permanent blocking
-                self.waiting_on_exposure_update = False
-                self.capture_button.setEnabled(True)
-                return
-            else:
-                self.print_terminal("Exposure update complete, proceeding with capture")
+            self.print_terminal("Cannot capture while exposure is updating")
+            return
 
         try:
             nframes = int(self.nframes_input.text().strip())
@@ -1045,252 +2051,15 @@ class SciCamGUI(QWidget):
             self.print_terminal("Invalid number of frames; defaulting to 1")
             nframes = 1
 
-        self.CL.SerialClose()
+        # Setup and start capture thread
+        self.capture_thread.setup_capture(
+            nframes, self.save_as_stack, self.custom_headers, self.custom_filename
+        )
 
-        # Initialize list for stacking if needed
-        image_stack = []
-        stack_headers = []
-        stack_filename = None
-
-        for i in range(nframes):
-            self.status_label.setText(f"Status: Waiting for frame {i+1}/{nframes}...")
-
-            CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
-            CirAq.Open(0)
-            numbuffers = 2
-            BufArr = CirAq.BufferSetup(numbuffers)
-            CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-            CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
-
-            framearr = False
-            t0 = time.time()
-            self.print_terminal(f"Starting recording {i+1}/{nframes} ..")
-
-            while not framearr:
-                try:
-                    curBuf = CirAq.WaitForFrame(1000)
-                except Buf.PythonMemException:
-                    self.print_terminal("Waiting for frame arrival")
-                    CirAq.AqCleanup()
-                    CirAq.BufferCleanup()
-                    CirAq.Close()
-
-                    CirAq = Buf.clsCircularAcquisition(Buf.ErrorMode.ErIgnore)
-                    CirAq.Open(0)
-                    BufArr = CirAq.BufferSetup(numbuffers)
-                    CirAq.AqSetup(Buf.SetupOptions.setupDefault)
-                    CirAq.AqControl(Buf.AcqCommands.Start, Buf.AcqControlOptions.Wait)
-                    continue
-                else:
-                    framearr = True
-                    bufnum = curBuf.BufferNumber
-                    t1 = time.time()
-
-            total_time = t1 - t0
-            self.print_terminal(f"Total acquisition time: {total_time:.2f} seconds")
-
-            img = np.copy(np.asarray(BufArr[bufnum], dtype=np.uint16))
-            CirAq.AqCleanup()
-            CirAq.BufferCleanup()
-            CirAq.Close()
-
-            now = datetime.now(timezone.utc).replace(microsecond=0)
-            curtime = now.strftime("%Y%m%dT%H%M%S")
-            folder = self.save_path_input.text().strip()
-            os.makedirs(folder, exist_ok=True)
-
-            # Create header
-            hdr = fits.Header()
-            mjd = now.timestamp() / 86400.0 + 40587  # Convert Unix time to MJD
-            hdr["MJD-OBS"] = (mjd, "Modified Julian Date of observation")
-
-            object_name = self.object_input.text().strip()
-            observer_name = self.observer_input.text().strip()
-            if object_name:
-                hdr["OBJECT"] = (object_name, "Object name")
-            if observer_name:
-                hdr["OBSERVER"] = (observer_name, "Observer name")
-
-            CLOCK_FREQ_MHZ = 15.0
-            queries = {
-                "EXPTIME": ("SENS:EXPPER?", "Exposure time (s)"),
-                "FRMTIME": ("SENS:FRAMEPER?", "Frame period (s)"),
-                "CLKFREQ": ("SENS:CLOCKFREQ?", "Clock frequency"),
-                "XSIZE": ("SENS:XSIZE?", "Horizontal ROI size"),
-                "YSIZE": ("SENS:YSIZE?", "Vertical ROI size"),
-                "XSTART": ("SENS:XSTART?", "Horizontal ROI start"),
-                "YSTART": ("SENS:YSTART?", "Vertical ROI start"),
-                "TMP_SET": ("TEMP:SENS:SET?", "Sensor temp setpoint"),
-                "TMP_CUR": ("TEMP:SENS?", "Sensor temp (C)"),
-                "TEC_EN": ("TEC:EN?", "TEC enabled"),
-                "TEC_LOCK": ("TEC:LOCK?", "TEC locked"),
-                "FORMAT": ("DATA:FORMAT?", "Data format"),
-                "GAINCOR": ("CORR:GAIN?", "Gain corr. enabled"),
-                "OFFCOR": ("CORR:OFFSET?", "Offset corr. enabled"),
-                "SUBCOR": ("CORR:SUB?", "Pixel subst. enabled"),
-                "SOCNAME": ("SOC?", "Current SOC"),
-                "MODEL": ("SYS:MODEL?", "Model"),
-                "SERIAL": ("SYS:SN?", "Serial number"),
-                "FWVERS": ("SYS:FW?", "Firmware version"),
-                "SWVERS": ("SYS:SW?", "Software version"),
-            }
-
-            self.setup_serial()
-            time.sleep(0.2)
-            for key, (cmd, comment) in queries.items():
-                val = self.query_scalar(cmd)
-                if val is not None and not val.startswith(cmd):
-                    try:
-                        if key in ["EXPTIME", "FRMTIME"] and val.isdigit():
-                            val = int(val)
-                            val = val / (CLOCK_FREQ_MHZ * 1e6)
-                        elif key == "CLKFREQ":
-                            val = float(val.strip("MHZmhz")) * 1e6
-                        elif key in ["XSIZE", "YSIZE", "XSTART", "YSTART"]:
-                            val = int(val)
-                        elif key in ["TMP_CUR", "TMP_SET"]:
-                            val = float(val)
-                        elif key in [
-                            "TEC_EN",
-                            "TEC_LOCK",
-                            "GAINCOR",
-                            "OFFCOR",
-                            "SUBCOR",
-                        ]:
-                            val = 1 if val.upper() == "ON" else 0
-                        else:
-                            val = val.strip()
-                        hdr[key] = (val, comment)
-                    except Exception as e:
-                        self.print_terminal(
-                            f"Error converting {key} with value '{val}': {e}"
-                        )
-
-            # Add custom headers
-            if hasattr(self, "custom_headers") and self.custom_headers:
-                self._add_custom_headers(hdr, self.custom_headers)
-
-            # Add frame-specific info for stacks
-            if self.save_as_stack:
-                hdr["FRAME"] = (i + 1, "Frame number in stack")
-                hdr["DATEOBS"] = (now.isoformat(), "Date-time of this frame")
-
-            self.CL.SerialClose()
-
-            # Save based on mode
-            if self.save_as_stack:
-                # Store for stack
-                image_stack.append(img)
-                stack_headers.append(hdr)
-                if i == 0:
-                    # Allow custom filename or use default
-                    if hasattr(self, "custom_filename") and self.custom_filename:
-                        base_filename = self.custom_filename
-                        if not base_filename.endswith(".fits"):
-                            base_filename += ".fits"
-                        stack_filename = os.path.join(folder, base_filename)
-                    else:
-                        stack_filename = os.path.join(
-                            folder, "scicam_stack_" + curtime + ".fits"
-                        )
-                self.status_label.setText(f"Collected frame {i+1}/{nframes} for stack")
-
-                # Update viewer for each frame in stack mode
-                if hasattr(self, "viewer") and self.viewer:
-                    self.viewer.update_image(img)
-                    QApplication.processEvents()  # Force GUI update
-            else:
-                # Save individual file
-                if (
-                    hasattr(self, "custom_filename")
-                    and self.custom_filename
-                    and nframes == 1
-                ):
-                    # Use custom filename for single frame
-                    base_filename = self.custom_filename
-                    if not base_filename.endswith(".fits"):
-                        base_filename += ".fits"
-                    filename = os.path.join(folder, base_filename)
-                else:
-                    # Use default naming for multiple frames or no custom name
-                    filename = os.path.join(folder, "scicam_" + curtime + ".fits")
-
-                hdu = fits.PrimaryHDU(img, header=hdr)
-                hdu.writeto(filename, overwrite=True)
-                self.status_label.setText(f"Saved: {filename}")
-
-                # Send notification to TCP clients if connected
-                if self.command_server:
-                    notification = {
-                        "event": "frame_saved",
-                        "filename": filename,
-                        "frame": i + 1,
-                        "total_frames": nframes,
-                    }
-                    self.command_server.send_response(json.dumps(notification))
-
-                # Update viewer for individual frames
-                if hasattr(self, "viewer") and self.viewer:
-                    self.viewer.update_image(img)
-
-            if i == nframes - 1:
-                self.setup_serial()
-                time.sleep(0.2)
-
-        # If stacking, save the stack now
-        if self.save_as_stack and image_stack:
-            self.print_terminal(f"Saving stack of {len(image_stack)} frames...")
-
-            # Create 3D array (frames, y, x)
-            data_cube = np.array(image_stack, dtype=np.uint16)
-
-            # Use first header as primary, add stack-specific keywords
-            primary_hdr = stack_headers[0].copy()
-            primary_hdr["NAXIS"] = 3
-            primary_hdr["NAXIS3"] = len(image_stack)
-            primary_hdr["NFRAMES"] = (len(image_stack), "Number of frames in stack")
-            primary_hdr["STACKTYP"] = ("TEMPORAL", "Type of stack")
-
-            # Create primary HDU with data cube
-            primary_hdu = fits.PrimaryHDU(data_cube, header=primary_hdr)
-
-            # Create HDU list
-            hdul = fits.HDUList([primary_hdu])
-
-            # Optionally add individual frame headers as extensions
-            for idx, hdr in enumerate(stack_headers):
-                # Create a table with frame metadata
-                col1 = fits.Column(name="FRAME", format="I", array=[idx + 1])
-                col2 = fits.Column(name="MJD_OBS", format="D", array=[hdr["MJD-OBS"]])
-                cols = fits.ColDefs([col1, col2])
-                tbhdu = fits.BinTableHDU.from_columns(cols)
-                tbhdu.header["EXTNAME"] = f"FRAME{idx+1}"
-                for key in ["MJD-OBS", "TMP_CUR", "DATEOBS"]:
-                    if key in hdr:
-                        tbhdu.header[key] = hdr[key]
-                hdul.append(tbhdu)
-
-            # Save the stack
-            hdul.writeto(stack_filename, overwrite=True)
-            hdul.close()
-
-            self.status_label.setText(f"Saved stack: {stack_filename}")
-            self.print_terminal(f"Stack saved: {stack_filename}")
-
-            # Send notification for stack
-            if self.command_server:
-                notification = {
-                    "event": "stack_saved",
-                    "filename": stack_filename,
-                    "frames": len(image_stack),
-                    "total_frames": nframes,
-                }
-                self.command_server.send_response(json.dumps(notification))
-
-        # Reset capture settings
-        self.custom_headers = {}
-        self.save_as_stack = False
-        self.custom_filename = None
+        if not self.capture_thread.isRunning():
+            self.capture_thread.start()
+        else:
+            self.print_terminal("Capture already in progress!")
 
     def _add_custom_headers(self, hdr, headers_input):
         """Add custom headers from various input formats"""
@@ -1300,11 +2069,25 @@ class SciCamGUI(QWidget):
                 for key, value in headers_input.items():
                     if isinstance(value, (list, tuple)) and len(value) >= 2:
                         # (key, value, comment) format
-                        hdr[key.upper()] = (
-                            value[0],
-                            value[1] if len(value) > 1 else "",
-                        )
+                        header_value = value[0]
+                        comment = value[1] if len(value) > 1 else ""
+
+                        # Replace None with empty string for FITS compatibility
+                        if header_value is None:
+                            header_value = ""
+                            self.print_terminal(
+                                f"Replacing None value in header {key} with empty string"
+                            )
+
+                        hdr[key.upper()] = (header_value, comment)
                     else:
+                        # Replace None with empty string
+                        if value is None:
+                            value = ""
+                            self.print_terminal(
+                                f"Replacing None value in header {key} with empty string"
+                            )
+
                         hdr[key.upper()] = value
 
             # If it's a list of tuples or Card objects
@@ -1315,11 +2098,26 @@ class SciCamGUI(QWidget):
                             key = str(item[0]).upper()
                             value = item[1]
                             comment = item[2] if len(item) > 2 else ""
+
+                            # Replace None with empty string for FITS compatibility
+                            if value is None:
+                                value = ""
+                                self.print_terminal(
+                                    f"Replacing None value in header {key} with empty string"
+                                )
+
                             hdr[key] = (value, comment)
                     elif hasattr(item, "keyword") and hasattr(item, "value"):
                         # Astropy Card object
+                        value = item.value
+                        if value is None:
+                            value = ""
+                            self.print_terminal(
+                                f"Replacing None value in header {item.keyword} with empty string"
+                            )
+
                         hdr[item.keyword] = (
-                            item.value,
+                            value,
                             item.comment if hasattr(item, "comment") else "",
                         )
 
@@ -1331,17 +2129,55 @@ class SciCamGUI(QWidget):
         if self.command_server:
             self.command_server.stop()
             self.command_server.wait()
+        # Stop capture thread if running
+        if self.capture_thread.isRunning():
+            self.capture_thread.terminate()
+            self.capture_thread.wait()
         event.accept()
 
 
 if __name__ == "__main__":
+
+    # GET ANY COMMAND LINE ARGUMENTS
+    args = sys.argv[1:]
+    print(f"wsp.py: args = {args}")
+
+    options = "t:"
+    long_options = ["trigmode"]
+
+    trigmode = TrigMode.SINGLE  # default
+
+    try:
+        # short "-t MODE", long "--trigmode=MODE"
+        opts, values = getopt.getopt(args, options, long_options)
+        # checking each argument
+        print()
+        print(f"gui.py: Parsing sys.argv...")
+        print(f"gui.py: opts = {opts}")
+        print(f"gui.py: values = {values}")
+    except getopt.GetoptError as e:
+        print(f"Argument error: {e}")
+        sys.exit(2)
+
+    for opt, val in opts:
+        if opt in ("-t", "--trigmode"):
+            val = str(val).strip().upper()
+            trigmode = TrigMode[val] if val in TrigMode.__members__ else TrigMode.STREAM
+
+    # validate
+    if trigmode not in (TrigMode.SINGLE, TrigMode.STREAM):
+        print(f"Unknown trigmode '{trigmode}', falling back to STREAM")
+        trigmode = TrigMode.STREAM
+
+    print(f"gui.py: trigmode = {trigmode}")
+
     app = QApplication(sys.argv)
     viewer = ImageViewer()
     viewer.show()
 
     # You can disable the server by setting enable_server=False
     # or change the port with server_port=XXXX
-    window = SciCamGUI(enable_server=True, server_port=5555)
+    window = SciCamGUI(enable_server=True, server_port=5555, trigmode=trigmode)
     window.viewer = viewer
     window.show()
     sys.exit(app.exec_())
