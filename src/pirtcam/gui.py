@@ -189,7 +189,9 @@ class ImageViewer(QWidget):
         self.hist_plot.setMouseEnabled(x=True, y=False)
 
         # a grayscale LUT (optional; looks nice)
-        lut = pg.colormap.get("gray").getLookupTable(0.0, 1.0, 256)
+        lut = self._pg.ColorMap(
+            [0.0, 1.0], [[0, 0, 0], [255, 255, 255]]
+        ).getLookupTable(0.0, 1.0, 256)
         self.img_item.setLookupTable(lut)
         self.img_item.setLevels([0, 255])
 
