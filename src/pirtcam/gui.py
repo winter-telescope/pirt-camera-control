@@ -151,75 +151,132 @@ class CommandServer(QThread):
 
 
 class ImageViewer(QWidget):
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_qt5agg import (
+        FigureCanvasQTAgg as FigureCanvas,  # kept for compatibility
+    )
+    from matplotlib.figure import Figure  # kept for compatibility
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PIRT Quick Look Viewer")
         self.setGeometry(750, 100, 600, 600)
-        self.layout = QVBoxLayout()
+
+        # cache of last rendered images so we can rescale on resize without recomputing
+        self._last_qimg = None
+        self._last_qimg_hist = None
+
+        # --- layout ---
+        root = QVBoxLayout()
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+
         self.image_label = QLabel("No image yet")
         self.image_label.setAlignment(Qt.AlignCenter)
-        image_hist_split = QVBoxLayout()
-        image_hist_split.setContentsMargins(0, 0, 0, 0)
-        image_hist_split.setSpacing(2)
-        image_hist_split.addWidget(self.image_label, stretch=5)
+        # Important: let the label ignore its pixmap's size so it doesn't force the window to grow
+        from PyQt5.QtWidgets import QSizePolicy
+
+        self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.image_label.setScaledContents(
+            True
+        )  # label will scale pixmap to its own size
+
         self.hist_label = QLabel()
         self.hist_label.setAlignment(Qt.AlignCenter)
-        image_hist_split.addWidget(self.hist_label, stretch=1)
-        self.layout.addLayout(image_hist_split)
-        self.hist_label.setAlignment(Qt.AlignCenter)
+        # Keep histogram at a stable height so it can't grow the window
+        self.hist_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.hist_label.setScaledContents(True)
+        self.hist_label.setFixedHeight(140)
 
-        self.setLayout(self.layout)
+        split = QVBoxLayout()
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(4)
+        split.addWidget(self.image_label, stretch=5)
+        split.addWidget(self.hist_label, stretch=0)
 
-    def update_image(self, data):
-        median = np.median(data)
-        std = np.std(data)
+        root.addLayout(split)
+        self.setLayout(root)
+
+    def update_image(self, data: np.ndarray):
+        """Render clipped image + histogram into labels without changing window size."""
+        # --- robust z-scale clip ---
+        median = float(np.median(data))
+        std = float(np.std(data))
         lower = median - 3 * std
         upper = median + 3 * std
         clipped = np.clip(data, lower, upper)
-        norm_data = 255 * (clipped - lower) / (upper - lower if upper > lower else 1)
-        norm_data = norm_data.astype(np.uint8)
+        norm = 255 * (clipped - lower) / (upper - lower if upper > lower else 1.0)
+        norm = norm.astype(np.uint8)
 
+        # --- build QImage for the main view ---
+        h, w = norm.shape
+        qimg = QImage(
+            norm.data, w, h, w, QImage.Format_Grayscale8
+        ).copy()  # copy to own buffer
+        self._last_qimg = qimg  # cache
+
+        # --- build histogram as PNG -> QImage (like your original) ---
         from io import BytesIO
 
         import matplotlib.pyplot as plt
 
-        plt.figure(figsize=(4, 2))
-        plt.hist(
+        # Generate a compact histogram figure (content, not size, matters since we scale into the label)
+        fig = plt.figure(figsize=(4, 2), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.hist(
             data.ravel(),
             bins=256,
             color="gray",
             alpha=0.75,
             range=(median - 3 * std, median + 3 * std),
         )
-        mean = np.mean(data)
-        mode = np.bincount(data.ravel()).argmax() if data.size > 0 else 0
-        plt.title(
-            f"Histogram | Mean: {mean:.1f}, Median: {median:.1f}, Mode: {mode}, Std: {std:.1f}",
+        mean = float(np.mean(data))
+        mode = int(np.bincount(data.ravel()).argmax()) if data.size > 0 else 0
+        ax.set_title(
+            f"Histogram | Mean: {mean:.1f}, Med: {median:.1f}, Mode: {mode}, Std: {std:.1f}",
             fontsize=8,
         )
-        plt.tight_layout()
+        ax.tick_params(labelsize=7)
+        fig.tight_layout(pad=0.5)
+
         buf = BytesIO()
-        plt.savefig(buf, format="png")
+        fig.savefig(buf, format="png")
+        plt.close(fig)
         buf.seek(0)
-        plt.close()
 
         qimg_hist = QImage()
         qimg_hist.loadFromData(buf.read(), "PNG")
-        self.hist_label.setPixmap(
-            QPixmap.fromImage(qimg_hist).scaledToWidth(
-                self.width(), Qt.SmoothTransformation
+        self._last_qimg_hist = qimg_hist  # cache
+
+        # push into labels using the labels' own sizes (no feedback loop)
+        self._apply_scaled_pixmaps()
+
+    def resizeEvent(self, event):
+        """On any resize, rescale the last images to the new label sizes."""
+        super().resizeEvent(event)
+        self._apply_scaled_pixmaps()
+
+    def _apply_scaled_pixmaps(self):
+        if self._last_qimg is not None:
+            # scale the main image to the image_label's current size
+            pm = QPixmap.fromImage(self._last_qimg).scaled(
+                self.image_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
             )
-        )
-        h, w = norm_data.shape
-        qimg = QImage(norm_data.data, w, h, w, QImage.Format_Grayscale8)
-        self.image_label.setPixmap(
-            QPixmap.fromImage(qimg).scaled(
-                self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            self.image_label.setPixmap(pm)
+
+        if self._last_qimg_hist is not None:
+            # scale histogram to hist_label's width/height (fixed height), keep aspect ratio
+            # using current label size prevents the window growth feedback
+            target_size = self.hist_label.size()
+            if target_size.width() <= 0 or target_size.height() <= 0:
+                return
+            pmh = QPixmap.fromImage(self._last_qimg_hist).scaled(
+                target_size,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
             )
-        )
+            self.hist_label.setPixmap(pmh)
 
 
 class CaptureThread(QThread):
