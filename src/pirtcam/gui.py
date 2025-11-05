@@ -333,8 +333,8 @@ class CaptureThread(QThread):
                         max_retries = 3
                         retry_count = 0
                         wait_timeout_ms = int(
-                            max(5000, (expected_time + 5.0) * 1000)
-                        )  # At least 5s, or exposure+5s
+                            max(10000, (expected_time + 3.0) * 1000)
+                        )  # At least 10s, or exposure+3s
 
                         while not framearr and retry_count < max_retries:
                             try:
@@ -509,6 +509,13 @@ class CaptureThread(QThread):
                     CirAq.BufferCleanup()
                     CirAq.Close()
 
+                # Store the actual exposure duration
+                self.parent.last_exposure_duration = total_time
+
+                self.parent.print_terminal(
+                    f"[single] Frame received! Total time: {total_time:.2f}s"
+                )
+
                 # Create FITS header and save
                 now = datetime.now(timezone.utc).replace(microsecond=0)
                 curtime = now.strftime("%Y%m%dT%H%M%S")
@@ -528,6 +535,13 @@ class CaptureThread(QThread):
                     hdr["OBSERVER"] = (observer_name, "Observer name")
 
                 hdr["TRIGMODE"] = (self.trigmode.value, "Acquisition trigger mode")
+
+                # Add last exposure duration if available
+                if self.parent.last_exposure_duration is not None:
+                    hdr["AEXPTIME"] = (
+                        round(self.parent.last_exposure_duration, 3),
+                        "Actual exposure duration (s)",
+                    )
 
                 # Query camera parameters
                 CLOCK_FREQ_MHZ = 15.0
@@ -763,6 +777,9 @@ class SciCamGUI(QWidget):
         self.total_frames = 0
         self.frame_start_time = None
         self.current_exposure_time = 0.0
+        self.last_exposure_duration = None  # Track actual exposure time
+        self.serial_error_count = 0  # Track consecutive serial errors
+        self.max_serial_errors = 3  # Max errors before attempting reconnect
 
         # Initialize capture thread
         self.capture_thread = CaptureThread(parent=self, trigmode=self.trigmode)
@@ -1030,6 +1047,10 @@ class SciCamGUI(QWidget):
                     ),
                     "camera_state": self.camera_state.name,
                     "trigmode": self.trigmode.value,
+                    "last_exposure_duration": self.state.get(
+                        "last_exposure_duration", None
+                    ),
+                    "serial_error_count": self.serial_error_count,
                 }
                 response = {"status": "success", "data": status}
 
@@ -1197,6 +1218,16 @@ class SciCamGUI(QWidget):
             self.capture_progress.setFormat("Exposure: Idle")
 
         self.state.update({"capture_time_remaining": capture_time_remaining})
+
+        # Update last exposure duration display
+        if self.last_exposure_duration is not None:
+            self.last_exposure_label.setText(
+                f"Last Exposure: {self.last_exposure_duration:.2f}s"
+            )
+            self.state.update({"last_exposure_duration": self.last_exposure_duration})
+        else:
+            self.last_exposure_label.setText("Last Exposure: N/A")
+            self.state.update({"last_exposure_duration": None})
 
         # Update visual indicators
         if is_ready:
@@ -1405,51 +1436,6 @@ class SciCamGUI(QWidget):
         self.CL.SetBaudRate(CLCom.BaudRates.CLBaudRate115200)
         time.sleep(0.2)
 
-    # serial helpers
-    def prepare_one_shot(self):
-        """Prime camera for exactly one triggered exposure (do NOT start it)."""
-        self.setup_serial()
-
-        # query the current trigger mode
-        self.trigger_mode = self.query_scalar("SENS:TRIG:MODE?")
-        self.print_terminal(f"Current trigger mode: {self.trigger_mode}")
-        try:
-            # Ensure we won't free-run and we only accept one trigger
-            self.send_command("SENS:TRIG OFF")
-            # tiny settle so the next write isn't coalesced on the device side
-            time.sleep(0.01)
-            self.send_command("SENS:TRIG:COUNT 1")
-        finally:
-            self.CL.SerialClose()
-
-    def fire_one_shot(self):
-        """Start the exposure now (soft-trigger-on semantics)."""
-        self.setup_serial()
-        try:
-            self.send_command("SENS:TRIG ON")
-        finally:
-            self.CL.SerialClose()
-
-    def disarm_trigger(self):
-        """Ensure trigger is off after a shot or on error."""
-        self.setup_serial()
-        try:
-            self.send_command("SENS:TRIG OFF")
-        finally:
-            self.CL.SerialClose()
-
-    def query_trigger_sent(self) -> int | None:
-        """Return 1 if a trigger was sent/consumed, else 0/None."""
-        self.setup_serial()
-        try:
-            val = self.query_scalar("SENS:TRIG:SENT?")
-            if val is not None:
-                s = str(val).strip()
-                return int(s) if s.isdigit() else None
-            return None
-        finally:
-            self.CL.SerialClose()
-
     def setup_ui(self):
         layout = QVBoxLayout()
 
@@ -1508,6 +1494,10 @@ class SciCamGUI(QWidget):
         # Add timeout remaining label
         self.timeout_label = QLabel("Timeout: N/A")
         labels_layout.addWidget(self.timeout_label)
+
+        # Add last exposure duration label
+        self.last_exposure_label = QLabel("Last Exposure: N/A")
+        labels_layout.addWidget(self.last_exposure_label)
 
         # Add capture status indicators
         self.capture_status_label = QLabel("Capture: Idle")
@@ -1814,6 +1804,7 @@ class SciCamGUI(QWidget):
         self.print_terminal("WARNING: TEC failed to lock within timeout.")
 
     def query_scalar(self, command):
+        """Query camera with automatic serial reconnection on failure"""
         try:
             self.CL.SerialWrite(command + "\r", 100)
             time.sleep(0.05)
@@ -1827,6 +1818,7 @@ class SciCamGUI(QWidget):
                         break
                 else:
                     time.sleep(0.05)
+
             lines = [line.strip() for line in output.splitlines() if line.strip()]
             values = [
                 line
@@ -1834,11 +1826,63 @@ class SciCamGUI(QWidget):
                 if not line.startswith((">", command.split(":")[0], "ERROR"))
                 and line not in ("OK",)
             ]
+
             if values:
+                # Success - reset error count
+                self.serial_error_count = 0
                 return values[-1]
+            else:
+                # No response but no exception - might be communication issue
+                self.serial_error_count += 1
+                if self.serial_error_count >= self.max_serial_errors:
+                    self.print_terminal(
+                        f"Serial communication degraded ({self.serial_error_count} consecutive errors). "
+                        "Attempting reconnection..."
+                    )
+                    self.attempt_serial_reconnect()
+                return None
+
         except Exception as e:
+            self.serial_error_count += 1
             self.print_terminal(f"Error querying {command}: {e}")
-        return None
+
+            if self.serial_error_count >= self.max_serial_errors:
+                self.print_terminal(
+                    f"Multiple serial errors detected ({self.serial_error_count}). "
+                    "Attempting reconnection..."
+                )
+                self.attempt_serial_reconnect()
+            return None
+
+    def attempt_serial_reconnect(self):
+        """Attempt to reconnect serial communication"""
+        try:
+            self.print_terminal("Closing existing serial connection...")
+            try:
+                self.CL.SerialClose()
+            except:
+                pass  # Ignore errors when closing
+
+            time.sleep(0.5)  # Give port time to release
+
+            self.print_terminal("Re-initializing serial connection...")
+            self.setup_serial()
+
+            # Test the connection
+            test_response = self.query_scalar("SYS:MODEL?")
+            if test_response:
+                self.print_terminal("Serial reconnection successful!")
+                self.serial_error_count = 0
+                self.camera_state = CameraState.READY
+            else:
+                self.print_terminal(
+                    "Serial reconnection failed - no response from camera"
+                )
+                self.camera_state = CameraState.ERROR
+
+        except Exception as e:
+            self.print_terminal(f"Serial reconnection failed: {e}")
+            self.camera_state = CameraState.ERROR
 
     def enable_capture_button(self):
         """Re-enable capture button after exposure update completes"""
