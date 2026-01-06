@@ -74,11 +74,11 @@ class CameraClient:
         self.capture_history: List[CaptureProgress] = []
         self.progress_callbacks: List[Callable[[CaptureProgress], None]] = []
 
-    def connect(self):
-        """Connect to the camera GUI server"""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.connect((self.host, self.port))
-        self.socket.settimeout(0.1)  # Non-blocking receive
+    def connect(self, timeout: float = 1.0):
+        """Connect to the camera GUI server with a real connect timeout."""
+        self.socket = socket.create_connection((self.host, self.port), timeout=timeout)
+        # After connected, keep it “mostly non-blocking” for recv loop
+        self.socket.settimeout(0.1)
         print(f"Connected to camera server at {self.host}:{self.port}")
 
         # Start receive thread
