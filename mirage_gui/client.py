@@ -142,6 +142,10 @@ class CameraClient:
                     print(f"Receive error: {e}")
                 break
 
+        # Connection died - immediately unblock any send_command caller waiting on the queue
+        if self.running:
+            self.response_queue.put({"status": "error", "message": "Connection lost"})
+
     def _update_capture_progress(self, notification: Dict):
         """Update current capture progress"""
         if self.current_capture:
@@ -174,7 +178,7 @@ class CameraClient:
             self.response_queue.get()
 
         # Send command
-        command_json = json.dumps(command_dict)
+        command_json = json.dumps(command_dict) + "\n"  # ← add \n
         self.socket.send(command_json.encode("utf-8"))
 
         # Wait for primary response
