@@ -7,6 +7,11 @@ from datetime import datetime, timedelta
 from queue import Empty, Queue
 from typing import Callable, Dict, List, Optional
 
+# Per-frame software overhead on top of the camera's frame period, used for
+# time-remaining estimates only. Defined here rather than imported from gui.py
+# because the client runs off-instrument and gui.py pulls in the BitFlow DLLs.
+CAPTURE_OVERHEAD_S = 2.0
+
 
 @dataclass
 class CaptureProgress:
@@ -18,6 +23,15 @@ class CaptureProgress:
     last_frame_time: float
     exposure_time: float
     filenames: List[str]
+    # Camera frame period. Independent of exposure_time when the camera is in
+    # FIXED frame time mode, so estimates must use this rather than exposure.
+    frame_time: Optional[float] = None
+
+    @property
+    def expected_frame_duration(self) -> float:
+        """Estimated wall time per frame, including software overhead."""
+        base = self.frame_time if self.frame_time is not None else self.exposure_time
+        return base + CAPTURE_OVERHEAD_S
 
     @property
     def elapsed_time(self) -> float:
@@ -26,7 +40,7 @@ class CaptureProgress:
     @property
     def average_frame_time(self) -> float:
         if self.completed_frames == 0:
-            return self.exposure_time + 2.0  # Initial estimate
+            return self.expected_frame_duration  # Initial estimate
         return self.elapsed_time / self.completed_frames
 
     @property
@@ -57,6 +71,7 @@ class CaptureProgress:
             "estimated_time_remaining": self.estimated_time_remaining,
             "estimated_completion": self.estimated_completion_time.isoformat(),
             "exposure_time": self.exposure_time,
+            "frame_time": self.frame_time,
             "filenames": self.filenames,
         }
 
@@ -258,11 +273,15 @@ class CameraClient:
         if observer:
             self.set_observer_name(observer)
 
-        # Get current exposure time for progress estimation
+        # Get current exposure and frame time for progress estimation
         status = self.get_status()
         exposure_time = 1.0  # default
+        frame_time = None
         if status.get("status") == "success":
             exposure_time = float(status["data"].get("exposure", 1.0))
+            raw_frame_time = status["data"].get("frame_time")
+            if raw_frame_time is not None:
+                frame_time = float(raw_frame_time)
 
         # Initialize capture progress
         self.current_capture = CaptureProgress(
@@ -271,6 +290,7 @@ class CameraClient:
             start_time=time.time(),
             last_frame_time=time.time(),
             exposure_time=exposure_time,
+            frame_time=frame_time,
             filenames=[],
         )
 
@@ -337,7 +357,7 @@ class CameraClient:
         no_progress_time = 0
         last_completed = 0
         expected_time = (
-            (self.current_capture.exposure_time + 2.0) * nframes if stack else 0
+            self.current_capture.expected_frame_duration * nframes if stack else 0
         )
 
         if debug:
@@ -697,6 +717,47 @@ class CameraClient:
 
         self._debug = False
         return result
+
+    def set_frame_time(self, frame_seconds, wait=True):
+        """
+        Set the frame period explicitly, holding the current exposure time.
+
+        This switches the camera into FIXED frame time mode, so subsequent
+        set_exposure() calls will no longer move the frame period. That is the
+        mode you want for a PTC ramp: fixed frame rate, swept integration time.
+
+        The frame time must exceed the current exposure time by at least 0.1s;
+        if it does not, the call fails and the camera is left unchanged.
+
+        Args:
+            frame_seconds: Frame period in seconds
+            wait: If True, wait for the new timing to settle before returning
+        """
+        return self.send_command(
+            {"command": "SET_FRAME_TIME", "frame_time": frame_seconds, "wait": wait}
+        )
+
+    def set_frame_time_mode(self, mode, frame_time=None):
+        """
+        Set how the frame period responds to exposure changes.
+
+        Args:
+            mode: "AUTO"  - frame time follows exposure (exposure + overhead)
+                  "FIXED" - frame time is pinned and does not follow exposure
+            frame_time: Frame period in seconds. Only meaningful for FIXED; if
+                        omitted the current frame period is pinned as-is.
+        """
+        command = {"command": "SET_FRAME_TIME_MODE", "mode": str(mode).upper()}
+        if frame_time is not None:
+            command["frame_time"] = frame_time
+        return self.send_command(command)
+
+    def get_frame_time(self):
+        """Return the current frame period in seconds, or None if unavailable."""
+        status = self.get_status()
+        if status.get("status") != "success":
+            return None
+        return status["data"].get("frame_time")
 
     def set_tec_temperature(self, temp):
         """Set TEC temperature (-20, -40, or -60)"""

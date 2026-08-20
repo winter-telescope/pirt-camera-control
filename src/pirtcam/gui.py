@@ -41,6 +41,56 @@ class TrigMode(str, Enum):
     STREAM = "STREAM"
 
 
+class FrameTimeMode(str, Enum):
+    """How the frame period is determined when the exposure time changes.
+
+    AUTO:  frame time tracks exposure time, frame = exposure + overhead. This is
+           the historical behavior and the right default for normal observing.
+    FIXED: frame time is pinned at a user-supplied value and does not move when
+           the exposure changes. Needed for PTC ramps, where the frame rate must
+           stay constant while the integration time is swept.
+    """
+
+    AUTO = "AUTO"
+    FIXED = "FIXED"
+
+
+# Camera pixel clock. The camera works in clock cycles; everything the user sees
+# is in seconds.
+CLOCK_FREQ_MHZ = 15.0
+CLOCK_FREQ_HZ = CLOCK_FREQ_MHZ * 1e6
+
+# Firmware limits on SENS:EXPPER / SENS:FRAMEPER, in clock cycles.
+MIN_EXPOSURE_CYCLES = 12
+MAX_EXPOSURE_CYCLES = 4294967142
+MIN_FRAME_CYCLES = 1800
+MAX_FRAME_CYCLES = 4294967295
+
+# Padding between exposure and frame period. The frame period must exceed the
+# exposure period for readout; MIN_FRAME_OVERHEAD_S is our assumed floor for
+# that margin and DEFAULT_FRAME_OVERHEAD_S is what AUTO mode adds.
+DEFAULT_FRAME_OVERHEAD_S = 0.1
+MIN_FRAME_OVERHEAD_S = 0.1
+
+# Per-frame software overhead on top of the camera's frame period: serial
+# setup, arming the grabber, and writing the FITS file. Used only for progress
+# and time-remaining estimates, never for camera configuration.
+CAPTURE_OVERHEAD_S = 2.0
+
+# Slack added to the frame period when waiting for a single triggered frame.
+SINGLE_TRIGGER_OVERHEAD_S = 1.0
+
+
+def sec_to_cycles(seconds: float) -> int:
+    """Convert seconds to camera clock cycles."""
+    return int(seconds * CLOCK_FREQ_HZ)
+
+
+def cycles_to_sec(cycles: float) -> float:
+    """Convert camera clock cycles to seconds."""
+    return cycles / CLOCK_FREQ_HZ
+
+
 class CommandServer(QThread):
     """TCP/IP server running in separate thread to handle remote commands"""
 
@@ -365,12 +415,16 @@ class CaptureThread(QThread):
                         t_start = time.time()
                         self.parent.CL.SerialClose()
 
-                        # Get expected timing
+                        # Get expected timing. The frame arrives one frame period
+                        # after the trigger, not one exposure — these differ
+                        # whenever the frame time is set independently.
                         exp_s = float(self.parent.current_exposure_time or 0.0)
-                        expected_time = exp_s + 1.0
+                        frame_s = float(self.parent.current_frame_time or 0.0)
+                        expected_time = frame_s + SINGLE_TRIGGER_OVERHEAD_S
 
                         self.parent.print_terminal(
-                            f"[single] Trigger fired. Exposure: {exp_s:.1f}s, expected: ~{expected_time:.1f}s"
+                            f"[single] Trigger fired. Exposure: {exp_s:.1f}s, "
+                            f"frame: {frame_s:.1f}s, expected: ~{expected_time:.1f}s"
                         )
 
                         # 4) Wait for frame with BitFlow timeout workaround
@@ -624,6 +678,10 @@ class CaptureThread(QThread):
                     hdr["OBSERVER"] = (observer_name, "Observer name")
 
                 hdr["TRIGMODE"] = (self.trigmode.value, "Acquisition trigger mode")
+                hdr["FRMTMODE"] = (
+                    self.parent.frame_time_mode.value,
+                    "Frame time mode (AUTO/FIXED)",
+                )
 
                 # Add last exposure duration if available
                 if self.parent.last_exposure_duration is not None:
@@ -633,7 +691,6 @@ class CaptureThread(QThread):
                     )
 
                 # Query camera parameters
-                CLOCK_FREQ_MHZ = 15.0
                 queries = {
                     "EXPTIME": ("SENS:EXPPER?", "Exposure time (s)"),
                     "FRMTIME": ("SENS:FRAMEPER?", "Frame period (s)"),
@@ -664,9 +721,7 @@ class CaptureThread(QThread):
                     if val is not None and not val.startswith(cmd):
                         try:
                             if key in ["EXPTIME", "FRMTIME"] and val.isdigit():
-                                val = int(val)
-                                val = val / (CLOCK_FREQ_MHZ * 1e6)
-                                val = np.round(val, 3)
+                                val = np.round(cycles_to_sec(int(val)), 3)
                             elif key == "CLKFREQ":
                                 val = float(val.strip("MHZmhz")) * 1e6
                             elif key in ["XSIZE", "YSIZE", "XSTART", "YSTART"]:
@@ -822,7 +877,21 @@ class SciCamGUI(QWidget):
         super().__init__()
         self.trigmode = trigmode
         self.setWindowTitle("PIRT Control Panel")
-        self.setGeometry(100, 100, 600, 550)  # Slightly taller for progress bar
+        self.setGeometry(100, 100, 600, 600)  # Slightly taller for progress bar
+
+        # query_scalar() touches these on every call, including the startup
+        # queries below, so they have to exist before the first query.
+        self.serial_error_count = 0  # Track consecutive serial errors
+        self.max_serial_errors = 3  # Max errors before attempting reconnect
+
+        # Frame timing state. Must exist before setup_ui() builds the widgets
+        # that display it.
+        self.frame_time_mode = FrameTimeMode.AUTO
+        self.frame_time_overhead = DEFAULT_FRAME_OVERHEAD_S
+        self.current_exposure_time = 0.0
+        self.current_frame_time = 1.0 + DEFAULT_FRAME_OVERHEAD_S
+        self.fixed_frame_time = self.current_frame_time
+
         self.setup_ui()
         self.setup_serial()
 
@@ -830,29 +899,39 @@ class SciCamGUI(QWidget):
         self.exp_input.setValue(1.0)
         self.exp_input.blockSignals(False)
 
-        # Query current exposure time from camera and update the display value
+        # Query current exposure and frame period from the camera and adopt them
+        # as the displayed values.
         self.exp_input.blockSignals(True)
-        current_exp_str = self.query_scalar("SENS:EXPPER?")
-        if current_exp_str:
-            try:
-                CLOCK_FREQ = 15.0
-                current_cycles = int(current_exp_str)
-                current_exp_seconds = current_cycles / (CLOCK_FREQ * 1e6)
-                self.exp_input.setValue(current_exp_seconds)
-                self.print_terminal(
-                    f"Current camera exposure: {current_exp_seconds:.6f}s"
-                )
-            except ValueError:
-                self.print_terminal(
-                    f"Could not parse exposure cycles: {current_exp_str}, using default 1.0s"
-                )
-                self.exp_input.setValue(1.0)
+        current_cycles = self._query_cycles("SENS:EXPPER?")
+        if current_cycles is not None:
+            current_exp_seconds = cycles_to_sec(current_cycles)
+            self.exp_input.setValue(current_exp_seconds)
+            self.current_exposure_time = current_exp_seconds
+            self.print_terminal(f"Current camera exposure: {current_exp_seconds:.6f}s")
         else:
             self.print_terminal(
                 "Could not read exposure from camera, using default 1.0s"
             )
             self.exp_input.setValue(1.0)
+            self.current_exposure_time = 1.0
         self.exp_input.blockSignals(False)
+
+        current_frame_cycles = self._query_cycles("SENS:FRAMEPER?")
+        if current_frame_cycles is not None:
+            self.current_frame_time = cycles_to_sec(current_frame_cycles)
+            self.print_terminal(
+                f"Current camera frame time: {self.current_frame_time:.6f}s"
+            )
+        else:
+            self.print_terminal(
+                "Could not read frame period from camera, assuming "
+                f"exposure + {self.frame_time_overhead}s"
+            )
+            self.current_frame_time = (
+                self.current_exposure_time + self.frame_time_overhead
+            )
+        self.fixed_frame_time = self.current_frame_time
+        self._sync_timing_display()
 
         self.state = {}
 
@@ -865,10 +944,9 @@ class SciCamGUI(QWidget):
         self.current_frame = 0
         self.total_frames = 0
         self.frame_start_time = None
-        self.current_exposure_time = 0.0
+        # current_exposure_time / current_frame_time are seeded from the camera
+        # above; don't clobber them here.
         self.last_exposure_duration = None  # Track actual exposure time
-        self.serial_error_count = 0  # Track consecutive serial errors
-        self.max_serial_errors = 3  # Max errors before attempting reconnect
 
         # Initialize capture thread
         self.capture_thread = CaptureThread(parent=self, trigmode=self.trigmode)
@@ -996,6 +1074,64 @@ class SciCamGUI(QWidget):
                         "message": f"Exposure set to {exp_time}s (not waiting for settle)",
                     }
 
+            elif cmd_type == "SET_FRAME_TIME":
+                # Set the frame period explicitly, holding the exposure fixed.
+                frame_time = float(cmd_data.get("frame_time", 0.0))
+                wait_for_completion = cmd_data.get("wait", True)
+
+                self.frame_time_input.setValue(frame_time)
+                if not self.on_frame_time_changed():
+                    response = {
+                        "status": "error",
+                        "message": (
+                            f"Failed to set frame time to {frame_time}s - "
+                            f"out of range or shorter than the current exposure"
+                        ),
+                    }
+                elif wait_for_completion and self.waiting_on_exposure_update:
+                    wait_success = self.wait_for_exposure_update()
+                    response = {
+                        "status": "success" if wait_success else "warning",
+                        "message": (
+                            f"Frame time set to {frame_time}s and settled"
+                            if wait_success
+                            else f"Frame time set to {frame_time}s but wait timeout exceeded"
+                        ),
+                    }
+                    if self.command_server:
+                        self.print_terminal(
+                            f"Sending response: {response['status']} - {response.get('message', '')}"
+                        )
+                        self.command_server.send_response(json.dumps(response))
+                    return
+                else:
+                    response = {
+                        "status": "success",
+                        "message": f"Frame time set to {frame_time}s (not waiting for settle)",
+                    }
+
+            elif cmd_type == "SET_FRAME_TIME_MODE":
+                # Switch frame timing between AUTO and FIXED.
+                mode = cmd_data.get("mode", "")
+                frame_time = cmd_data.get("frame_time", None)
+                if frame_time is not None:
+                    frame_time = float(frame_time)
+
+                if self.set_frame_time_mode(mode, frame_time=frame_time):
+                    self._begin_timing_wait(f"Frame time mode set to {mode}")
+                    response = {
+                        "status": "success",
+                        "message": (
+                            f"Frame time mode set to {self.frame_time_mode.value} "
+                            f"(frame time {self.current_frame_time:.6f}s)"
+                        ),
+                    }
+                else:
+                    response = {
+                        "status": "error",
+                        "message": f"Failed to set frame time mode to {mode}",
+                    }
+
             elif cmd_type == "SET_TEC_TEMP":
                 # Set TEC temperature
                 temp = float(cmd_data.get("temperature", -40.0))
@@ -1110,6 +1246,9 @@ class SciCamGUI(QWidget):
                 status = {
                     "tec_locked": self.state.get("tec_lock", default),
                     "exposure": self.exp_input.value(),
+                    "frame_time": self.current_frame_time,
+                    "frame_time_mode": self.frame_time_mode.value,
+                    "frame_time_overhead": self.frame_time_overhead,
                     "nframes": int(self.nframes_input.text()),
                     "object": self.object_input.text(),
                     "observer": self.observer_input.text(),
@@ -1271,9 +1410,12 @@ class SciCamGUI(QWidget):
         exposure_time_remaining = 0.0
 
         if self.is_capturing:
+            # Per-frame wall time is the camera's frame period plus our own
+            # per-frame overhead (serial setup, grabber arm, FITS write).
+            expected_frame_time = self.current_frame_time + CAPTURE_OVERHEAD_S
+
             if self.frame_start_time:
                 frame_elapsed = time.time() - self.frame_start_time
-                expected_frame_time = self.current_exposure_time + 2.0
                 frame_remaining = max(0.0, expected_frame_time - frame_elapsed)
 
                 # Calculate exposure time remaining (without overhead)
@@ -1281,11 +1423,11 @@ class SciCamGUI(QWidget):
                     0.0, self.current_exposure_time - frame_elapsed
                 )
             else:
-                frame_remaining = self.current_exposure_time + 2.0
+                frame_remaining = expected_frame_time
                 exposure_time_remaining = self.current_exposure_time
 
             frames_left = self.total_frames - self.current_frame
-            remaining_frames_time = frames_left * (self.current_exposure_time + 2.0)
+            remaining_frames_time = frames_left * expected_frame_time
             capture_time_remaining = frame_remaining + remaining_frames_time
 
             # Update progress bar for exposure time
@@ -1634,8 +1776,47 @@ class SciCamGUI(QWidget):
         exp_row.addWidget(self.nframes_input)
         layout.addLayout(exp_row)
 
+        # Frame time controls. In AUTO the spinbox is a read-only mirror of
+        # exposure + overhead; in FIXED it becomes editable and the frame period
+        # stops following the exposure.
+        self.frame_time_label = QLabel("Frame Time (s):")
+        layout.addWidget(self.frame_time_label)
+
+        self.frame_time_input = QDoubleSpinBox()
+        self.frame_time_input.setDecimals(6)
+        self.frame_time_input.setRange(
+            MIN_FRAME_OVERHEAD_S, 999.999999 + MIN_FRAME_OVERHEAD_S
+        )
+        self.frame_time_input.setSingleStep(0.01)
+        self.frame_time_input.setValue(self.current_frame_time)
+        self.frame_time_input.setEnabled(self.frame_time_mode is FrameTimeMode.FIXED)
+
+        self.frame_time_mode_dropdown = QComboBox()
+        self.frame_time_mode_dropdown.addItems(
+            [FrameTimeMode.AUTO.value, FrameTimeMode.FIXED.value]
+        )
+        self.frame_time_mode_dropdown.setCurrentText(self.frame_time_mode.value)
+
+        frame_time_row = QHBoxLayout()
+        frame_time_row.addWidget(self.frame_time_input)
+        frame_time_row.addWidget(QLabel("Mode:"))
+        frame_time_row.addWidget(self.frame_time_mode_dropdown)
+        layout.addLayout(frame_time_row)
+
         QTimer.singleShot(
             0, lambda: self.exp_input.editingFinished.connect(self.on_exposure_changed)
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self.frame_time_input.editingFinished.connect(
+                self.on_frame_time_changed
+            ),
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self.frame_time_mode_dropdown.currentTextChanged.connect(
+                self.on_frame_time_mode_changed
+            ),
         )
 
         form_row = QHBoxLayout()
@@ -1742,127 +1923,290 @@ class SciCamGUI(QWidget):
 
         return output
 
-    def set_exposure(self, exposure_s):
-        """Set exposure time and frame period. Returns True on success, False on error."""
-        # Get the previous exposure time
-        previous_exposure_str = self.query_scalar("SENS:EXPPER?")
+    def _query_cycles(self, command):
+        """Query a cycle-count register. Returns an int, or None if unreadable."""
+        raw = self.query_scalar(command)
         try:
-            previous_exposure_cycles = (
-                int(previous_exposure_str) if previous_exposure_str else 0
-            )
+            return int(raw) if raw else None
         except ValueError:
+            self.print_terminal(f"Warning: could not parse {command} response: {raw}")
+            return None
+
+    def _send_timing(self, command, cycles, label):
+        """Send one timing register write. Returns True on success."""
+        result = self.send_command(f"{command} {cycles}")
+        if "Out of Range" in result or "ERROR" in result:
+            self.print_terminal(f"ERROR: {label} out of range. Cycles: {cycles}")
+            return False
+        return True
+
+    def apply_timing(self, exposure_s, frame_s):
+        """Set exposure period and frame period on the camera.
+
+        This is the single low-level entry point for camera timing. Both values
+        are explicit — nothing here derives one from the other. Returns True on
+        success; on failure the previous timing is restored where possible.
+        """
+        if frame_s < exposure_s + MIN_FRAME_OVERHEAD_S:
             self.print_terminal(
-                f"Warning: Could not parse previous exposure cycles: {previous_exposure_str}"
+                f"ERROR: frame time {frame_s:.6f}s too short for exposure "
+                f"{exposure_s:.6f}s (needs exposure + {MIN_FRAME_OVERHEAD_S}s)"
             )
-            previous_exposure_cycles = 0
+            return False
 
-        CLOCK_FREQ = 15.0
+        prev_exposure_cycles = self._query_cycles("SENS:EXPPER?")
+        prev_frame_cycles = self._query_cycles("SENS:FRAMEPER?")
 
-        # Calculate new exposure and frame period cycles
-        exposure_cycles = int((exposure_s * 1e6 * 1000) / (1e3 / CLOCK_FREQ))
-        exposure_cycles = max(12, min(exposure_cycles, 4294967142))
+        exposure_cycles = max(
+            MIN_EXPOSURE_CYCLES, min(sec_to_cycles(exposure_s), MAX_EXPOSURE_CYCLES)
+        )
+        frame_cycles = max(
+            MIN_FRAME_CYCLES, min(sec_to_cycles(frame_s), MAX_FRAME_CYCLES)
+        )
 
-        frame_cycles = int(((exposure_s + 0.1) * 1e6 * 1000) / (1e3 / CLOCK_FREQ))
-        frame_cycles = max(1800, min(frame_cycles, 4294967295))
+        self.print_terminal(
+            f"Timing: exposure {prev_exposure_cycles} → {exposure_cycles} cycles, "
+            f"frame {prev_frame_cycles} → {frame_cycles} cycles"
+        )
 
-        # The order matters!
-        # If we are increasing exposure, we need to set the frame period first
-        # If we are decreasing exposure, we need to set the exposure period first
-        if exposure_cycles > previous_exposure_cycles:
-            self.print_terminal(
-                f"Exposure increasing: {previous_exposure_cycles} → {exposure_cycles} cycles"
-            )
-            # Set frame period first
-            result = self.send_command(f"SENS:FRAMEPER {frame_cycles}")
-            if "Out of Range" in result or "ERROR" in result:
+        # Order matters: the camera rejects any state where the frame period is
+        # shorter than the exposure period, so we always widen the window before
+        # narrowing it. Growing the frame period first leaves the intermediate
+        # state (new_frame, prev_exposure), which is safe because new_frame >
+        # prev_frame >= prev_exposure. Shrinking it last leaves the intermediate
+        # state (prev_frame, new_exposure), safe because prev_frame >= new_frame
+        # >= new_exposure + overhead. Either way no intermediate state violates
+        # the constraint.
+        if prev_frame_cycles is None or frame_cycles > prev_frame_cycles:
+            writes = [
+                ("SENS:FRAMEPER", frame_cycles, "Frame period"),
+                ("SENS:EXPPER", exposure_cycles, "Exposure"),
+            ]
+        else:
+            writes = [
+                ("SENS:EXPPER", exposure_cycles, "Exposure"),
+                ("SENS:FRAMEPER", frame_cycles, "Frame period"),
+            ]
+
+        previous = {
+            "SENS:EXPPER": prev_exposure_cycles,
+            "SENS:FRAMEPER": prev_frame_cycles,
+        }
+
+        for index, (command, cycles, label) in enumerate(writes):
+            if self._send_timing(command, cycles, label):
+                continue
+            # Only the first write can have landed, so undoing it is enough to
+            # put the camera back exactly where it started.
+            if index > 0:
+                done_command, _, done_label = writes[0]
+                restore_to = previous[done_command]
+                if restore_to is None:
+                    self.print_terminal(
+                        f"WARNING: previous {done_label} unknown, cannot roll back"
+                    )
+                else:
+                    self.print_terminal(f"Rolling back {done_label}...")
+                    self._send_timing(done_command, restore_to, done_label)
+            return False
+
+        self.current_frame_time = cycles_to_sec(frame_cycles)
+        self.current_exposure_time = cycles_to_sec(exposure_cycles)
+        return True
+
+    def frame_time_for_exposure(self, exposure_s):
+        """Frame time that the current mode implies for a given exposure."""
+        if self.frame_time_mode is FrameTimeMode.FIXED:
+            return self.fixed_frame_time
+        return exposure_s + self.frame_time_overhead
+
+    def max_exposure_for_frame_time(self, frame_s):
+        """Longest exposure that fits inside a given frame time."""
+        return frame_s - MIN_FRAME_OVERHEAD_S
+
+    def set_exposure(self, exposure_s):
+        """Set exposure time, deriving the frame period from the current mode.
+
+        In AUTO mode the frame period follows the exposure. In FIXED mode the
+        frame period is left alone, and an exposure that will not fit inside it
+        is rejected outright rather than silently shortened — a quietly clipped
+        integration would corrupt a PTC ramp without any visible symptom.
+        """
+        frame_s = self.frame_time_for_exposure(exposure_s)
+
+        if self.frame_time_mode is FrameTimeMode.FIXED:
+            max_exp = self.max_exposure_for_frame_time(frame_s)
+            if exposure_s > max_exp:
                 self.print_terminal(
-                    f"ERROR: Frame period out of range. Cycles: {frame_cycles}"
+                    f"ERROR: exposure {exposure_s:.6f}s does not fit in the fixed "
+                    f"frame time of {frame_s:.6f}s (max {max_exp:.6f}s). "
+                    f"Camera unchanged."
                 )
                 return False
 
-            # Then set exposure
-            result = self.send_command(f"SENS:EXPPER {exposure_cycles}")
-            if "Out of Range" in result or "ERROR" in result:
-                self.print_terminal(
-                    f"ERROR: Exposure value out of range. Cycles: {exposure_cycles}"
-                )
-                # Try to restore frame period to match previous exposure
-                prev_frame_cycles = int(
-                    ((previous_exposure_cycles / (CLOCK_FREQ * 1e6)) + 0.1)
-                    * 1e6
-                    * 1000
-                    / (1e3 / CLOCK_FREQ)
-                )
-                self.send_command(f"SENS:FRAMEPER {prev_frame_cycles}")
+        if not self.apply_timing(exposure_s, frame_s):
+            return False
+
+        self._sync_timing_display()
+        return True
+
+    def set_frame_time(self, frame_s):
+        """Set the frame period explicitly, holding the current exposure.
+
+        Switches the GUI into FIXED mode, since an explicit frame time only has
+        meaning if something stops the next exposure change from overwriting it.
+        """
+        exposure_s = self.exp_input.value()
+        max_exp = self.max_exposure_for_frame_time(frame_s)
+        if exposure_s > max_exp:
+            self.print_terminal(
+                f"ERROR: frame time {frame_s:.6f}s is too short for the current "
+                f"exposure of {exposure_s:.6f}s (max exposure would be "
+                f"{max_exp:.6f}s). Lower the exposure first. Camera unchanged."
+            )
+            return False
+
+        if not self.apply_timing(exposure_s, frame_s):
+            return False
+
+        self.frame_time_mode = FrameTimeMode.FIXED
+        self.fixed_frame_time = frame_s
+        self._sync_timing_display()
+        return True
+
+    def set_frame_time_mode(self, mode, frame_time=None):
+        """Switch between AUTO and FIXED frame timing.
+
+        Returns True on success. Switching to FIXED without a frame_time pins
+        the frame period at its current value.
+        """
+        try:
+            mode = FrameTimeMode(str(mode).upper())
+        except ValueError:
+            self.print_terminal(f"ERROR: unknown frame time mode: {mode}")
+            return False
+
+        previous_mode = self.frame_time_mode
+        previous_fixed = self.fixed_frame_time
+
+        if mode is FrameTimeMode.FIXED:
+            if frame_time is None:
+                frame_time = self.current_frame_time
+            self.frame_time_mode = FrameTimeMode.FIXED
+            if not self.set_frame_time(frame_time):
+                self.frame_time_mode = previous_mode
+                self.fixed_frame_time = previous_fixed
                 return False
         else:
-            self.print_terminal(
-                f"Exposure decreasing: {previous_exposure_cycles} → {exposure_cycles} cycles"
-            )
-            # Set exposure first
-            result = self.send_command(f"SENS:EXPPER {exposure_cycles}")
-            if "Out of Range" in result or "ERROR" in result:
-                self.print_terminal(
-                    f"ERROR: Exposure value out of range. Cycles: {exposure_cycles}"
-                )
+            self.frame_time_mode = FrameTimeMode.AUTO
+            # Re-apply the current exposure so the frame period catches back up.
+            if not self.set_exposure(self.exp_input.value()):
+                self.frame_time_mode = previous_mode
+                self.fixed_frame_time = previous_fixed
                 return False
 
-            # Then set frame period
-            result = self.send_command(f"SENS:FRAMEPER {frame_cycles}")
-            if "Out of Range" in result or "ERROR" in result:
-                self.print_terminal(
-                    f"ERROR: Frame period out of range. Cycles: {frame_cycles}"
-                )
-                # Try to restore exposure to previous value
-                self.send_command(f"SENS:EXPPER {previous_exposure_cycles}")
-                return False
-
+        self._sync_timing_display()
+        self.print_terminal(
+            f"Frame time mode: {self.frame_time_mode.value} "
+            f"(frame time {self.current_frame_time:.6f}s)"
+        )
         return True
+
+    def _sync_timing_display(self):
+        """Push current timing state into the GUI widgets without re-triggering."""
+        if not hasattr(self, "frame_time_input"):
+            return
+        self.frame_time_input.blockSignals(True)
+        self.frame_time_input.setValue(self.current_frame_time)
+        self.frame_time_input.blockSignals(False)
+        # Frame time is only directly editable when it is not slaved to exposure.
+        self.frame_time_input.setEnabled(self.frame_time_mode is FrameTimeMode.FIXED)
+
+        self.frame_time_mode_dropdown.blockSignals(True)
+        self.frame_time_mode_dropdown.setCurrentText(self.frame_time_mode.value)
+        self.frame_time_mode_dropdown.blockSignals(False)
+
+    def _begin_timing_wait(self, description):
+        """Block captures for three frame periods so the new timing settles.
+
+        Three frame periods of the *applied* frame time, which in FIXED mode is
+        unrelated to the exposure — the old code derived this from exposure+0.1
+        and would under-wait whenever the frame time was longer than that.
+        """
+        self.waiting_on_exposure_update = True
+        wait_time_sec = 3 * self.current_frame_time
+        self.exposure_wait_time = wait_time_sec
+        self.exposure_wait_end_time = time.time() + wait_time_sec
+        self.capture_button.setEnabled(False)
+        self.print_terminal(f"{description} — delaying for {wait_time_sec:.1f} sec")
+        QTimer.singleShot(int(wait_time_sec * 1000), self.enable_capture_button)
 
     def on_exposure_changed(self):
         """Handle exposure time changes from GUI"""
         new_exp = self.exp_input.value()
 
         # Check if exposure is actually changing
-        current_exp_str = self.query_scalar("SENS:EXPPER?")
-        if current_exp_str:
-            try:
-                CLOCK_FREQ = 15.0
-                current_cycles = int(current_exp_str)
-                current_exp_seconds = np.round(current_cycles / (CLOCK_FREQ * 1e6), 3)
+        current_cycles = self._query_cycles("SENS:EXPPER?")
+        if current_cycles is not None:
+            current_exp_seconds = np.round(cycles_to_sec(current_cycles), 3)
 
-                # If exposure is within 0.001s of current, no need to change
-                if abs(current_exp_seconds - new_exp) < 0.001:
-                    self.print_terminal(
-                        f"Exposure already set to {new_exp}s, no change needed"
-                    )
-                    return True
-            except ValueError:
-                pass  # Continue with normal exposure setting if can't parse
+            # If exposure is within 0.001s of current, no need to change. In
+            # FIXED mode the frame period is independent, so an unchanged
+            # exposure really does mean there is nothing to do.
+            if abs(current_exp_seconds - new_exp) < 0.001:
+                self.print_terminal(
+                    f"Exposure already set to {new_exp}s, no change needed"
+                )
+                return True
 
         # Proceed with exposure change
         self.waiting_on_exposure_update = True
         self.exposure_update_start_time = time.time()
 
-        # Use set_exposure method for consistency
         if not self.set_exposure(new_exp):
             self.waiting_on_exposure_update = False
             self.capture_button.setEnabled(True)
             return False
 
-        # Calculate wait time based on frame period
-        CLOCK_FREQ = 15.0
-        frame_cycles = int(((new_exp + 0.1) * 1e6 * 1000) / (1e3 / CLOCK_FREQ))
-        frame_cycles = max(1800, min(frame_cycles, 4294967295))
+        self._begin_timing_wait(f"Exposure time changed to {new_exp}s")
+        return True
 
-        wait_time_sec = (3 * frame_cycles) / (CLOCK_FREQ * 1e6)
-        self.exposure_wait_time = wait_time_sec
-        self.exposure_wait_end_time = time.time() + wait_time_sec
-        self.capture_button.setEnabled(False)
-        self.print_terminal(
-            f"Exposure time changed to {new_exp}s — delaying for {wait_time_sec:.1f} sec"
-        )
-        QTimer.singleShot(int(wait_time_sec * 1000), self.enable_capture_button)
+    def on_frame_time_changed(self):
+        """Handle frame time changes from GUI.
+
+        Deliberately does not share on_exposure_changed's "unchanged, skip"
+        guard: the exposure may be identical while the frame time is what moved.
+        """
+        new_frame = self.frame_time_input.value()
+
+        current_cycles = self._query_cycles("SENS:FRAMEPER?")
+        if current_cycles is not None:
+            current_frame_seconds = np.round(cycles_to_sec(current_cycles), 3)
+            if abs(current_frame_seconds - new_frame) < 0.001:
+                self.print_terminal(
+                    f"Frame time already set to {new_frame}s, no change needed"
+                )
+                return True
+
+        self.waiting_on_exposure_update = True
+        self.exposure_update_start_time = time.time()
+
+        if not self.set_frame_time(new_frame):
+            self.waiting_on_exposure_update = False
+            self.capture_button.setEnabled(True)
+            # Put the spinbox back to what the camera is actually doing.
+            self._sync_timing_display()
+            return False
+
+        self._begin_timing_wait(f"Frame time changed to {new_frame}s")
+        return True
+
+    def on_frame_time_mode_changed(self, mode_text):
+        """Handle AUTO/FIXED dropdown changes from GUI"""
+        if not self.set_frame_time_mode(mode_text):
+            self._sync_timing_display()
+            return False
+        self._begin_timing_wait(f"Frame time mode changed to {mode_text}")
         return True
 
     def handle_tec_temp_change(self, target):
