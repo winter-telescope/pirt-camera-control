@@ -721,7 +721,11 @@ class CaptureThread(QThread):
                     if val is not None and not val.startswith(cmd):
                         try:
                             if key in ["EXPTIME", "FRMTIME"] and val.isdigit():
-                                val = np.round(cycles_to_sec(int(val)), 3)
+                                # Round to nanoseconds, not milliseconds: the
+                                # clock period is ~67ns and a log-spaced ramp
+                                # has sub-millisecond steps at the short end,
+                                # which 3 decimals would collapse together.
+                                val = float(np.round(cycles_to_sec(int(val)), 9))
                             elif key == "CLKFREQ":
                                 val = float(val.strip("MHZmhz")) * 1e6
                             elif key in ["XSIZE", "YSIZE", "XSTART", "YSTART"]:
@@ -2145,19 +2149,15 @@ class SciCamGUI(QWidget):
         """Handle exposure time changes from GUI"""
         new_exp = self.exp_input.value()
 
-        # Check if exposure is actually changing
+        # Check if exposure is actually changing. Compare in clock cycles, which
+        # is what the camera actually stores: anything that rounds to the same
+        # cycle count is genuinely a no-op. The old test skipped changes smaller
+        # than 1ms, which silently ignored more than half the steps of a
+        # log-spaced ramp below ~35ms.
         current_cycles = self._query_cycles("SENS:EXPPER?")
-        if current_cycles is not None:
-            current_exp_seconds = np.round(cycles_to_sec(current_cycles), 3)
-
-            # If exposure is within 0.001s of current, no need to change. In
-            # FIXED mode the frame period is independent, so an unchanged
-            # exposure really does mean there is nothing to do.
-            if abs(current_exp_seconds - new_exp) < 0.001:
-                self.print_terminal(
-                    f"Exposure already set to {new_exp}s, no change needed"
-                )
-                return True
+        if current_cycles is not None and sec_to_cycles(new_exp) == current_cycles:
+            self.print_terminal(f"Exposure already set to {new_exp}s, no change needed")
+            return True
 
         # Proceed with exposure change
         self.waiting_on_exposure_update = True
@@ -2180,13 +2180,11 @@ class SciCamGUI(QWidget):
         new_frame = self.frame_time_input.value()
 
         current_cycles = self._query_cycles("SENS:FRAMEPER?")
-        if current_cycles is not None:
-            current_frame_seconds = np.round(cycles_to_sec(current_cycles), 3)
-            if abs(current_frame_seconds - new_frame) < 0.001:
-                self.print_terminal(
-                    f"Frame time already set to {new_frame}s, no change needed"
-                )
-                return True
+        if current_cycles is not None and sec_to_cycles(new_frame) == current_cycles:
+            self.print_terminal(
+                f"Frame time already set to {new_frame}s, no change needed"
+            )
+            return True
 
         self.waiting_on_exposure_update = True
         self.exposure_update_start_time = time.time()
