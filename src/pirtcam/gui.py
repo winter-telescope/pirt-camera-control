@@ -1602,7 +1602,7 @@ class SciCamGUI(QWidget):
         labels_layout.addWidget(self.tec_setpoint_label)
 
         self.tec_temp_dropdown = QComboBox()
-        self.tec_temp_dropdown.addItems(["-20", "-40", "-60"])
+        self.tec_temp_dropdown.addItems(["-20", "-40", "-50", "-55","-60"])
         self.tec_temp_dropdown.setCurrentText("-40")
         self.tec_temp_dropdown.currentTextChanged.connect(self.handle_tec_temp_change)
         tec_temp_row = QHBoxLayout()
