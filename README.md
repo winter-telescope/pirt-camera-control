@@ -16,6 +16,20 @@ Try this:
 5. Update pip: `pip install --upgrade pip`
 6. Install dependencies: `pip install -e .` Alternately if you want to install the dev dependencies: `pip install -e ".[dev]"`
 
+## Behavior when the camera is not responding
+
+The GUI keeps running if the camera is off or the Camera Link serial link
+stops answering. It reports `camera_state: "ERROR"` and `camera_connected:
+false` in `GET_STATUS`, shows "Camera: NOT CONNECTED" in the window, and
+probes the camera with a single query every 10 s instead of running the full
+status refresh (which would block the GUI for ~25 s of serial timeouts).
+Remote commands that need the camera (`CAPTURE`, `SET_EXPOSURE`,
+`SET_FRAME_TIME*`, `SET_TEC_TEMP`, `TEC_EN`, `SET_CORRECTION`,
+`SERIAL_COMMAND`) get an immediate error reply while disconnected; `GET_STATUS`
+always answers. When the camera answers again the GUI re-reads exposure and
+frame period and returns to normal operation by itself. Startup no longer
+waits on the camera: the window and command server come up first.
+
 ## Workflow for updating tags
 Check the current version:
 ```bash:

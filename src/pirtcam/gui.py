@@ -875,6 +875,24 @@ class CameraState(Enum):
 class SciCamGUI(QWidget):
     waiting_on_exposure_update = False
 
+    # While the camera is not answering on the serial link, probe it this often
+    # (one short query) instead of running the full status refresh.
+    CAMERA_PROBE_INTERVAL_S = 10.0
+    # Remote commands that need a responding camera. Rejected immediately with
+    # an error reply while camera_connected is False.
+    CAMERA_COMMANDS = frozenset(
+        {
+            "CAPTURE",
+            "SET_EXPOSURE",
+            "SET_FRAME_TIME",
+            "SET_FRAME_TIME_MODE",
+            "SET_TEC_TEMP",
+            "TEC_EN",
+            "SET_CORRECTION",
+            "SERIAL_COMMAND",
+        }
+    )
+
     def __init__(
         self, enable_server=True, server_port=5555, trigmode: TrigMode = TrigMode.SINGLE
     ):
@@ -897,47 +915,31 @@ class SciCamGUI(QWidget):
         self.fixed_frame_time = self.current_frame_time
 
         self.setup_ui()
-        self.setup_serial()
+
+        # Camera (serial link) connection state. The camera is considered
+        # connected only after it has answered a query; until then, and
+        # whenever it stops answering, the GUI reports ERROR and probes it on
+        # a slow cadence rather than blocking on a dozen 2 s serial timeouts.
+        self.state = {"camera_connected": False}
+        self.camera_connected = False
+        self._disconnect_declared = False  # bookkeeping for a loss already done
+        self._needs_timing_resync = True
+        self._reconnecting = False
+        self._last_probe_time = 0.0
+        self._set_camera_connection_label(False, "not yet contacted")
+
+        try:
+            self.setup_serial()
+        except Exception as e:
+            self.print_terminal(f"Could not open camera serial link: {e}")
 
         self.exp_input.blockSignals(True)
         self.exp_input.setValue(1.0)
         self.exp_input.blockSignals(False)
-
-        # Query current exposure and frame period from the camera and adopt them
-        # as the displayed values.
-        self.exp_input.blockSignals(True)
-        current_cycles = self._query_cycles("SENS:EXPPER?")
-        if current_cycles is not None:
-            current_exp_seconds = cycles_to_sec(current_cycles)
-            self.exp_input.setValue(current_exp_seconds)
-            self.current_exposure_time = current_exp_seconds
-            self.print_terminal(f"Current camera exposure: {current_exp_seconds:.6f}s")
-        else:
-            self.print_terminal(
-                "Could not read exposure from camera, using default 1.0s"
-            )
-            self.exp_input.setValue(1.0)
-            self.current_exposure_time = 1.0
-        self.exp_input.blockSignals(False)
-
-        current_frame_cycles = self._query_cycles("SENS:FRAMEPER?")
-        if current_frame_cycles is not None:
-            self.current_frame_time = cycles_to_sec(current_frame_cycles)
-            self.print_terminal(
-                f"Current camera frame time: {self.current_frame_time:.6f}s"
-            )
-        else:
-            self.print_terminal(
-                "Could not read frame period from camera, assuming "
-                f"exposure + {self.frame_time_overhead}s"
-            )
-            self.current_frame_time = (
-                self.current_exposure_time + self.frame_time_overhead
-            )
+        self.current_exposure_time = 1.0
+        self.current_frame_time = self.current_exposure_time + self.frame_time_overhead
         self.fixed_frame_time = self.current_frame_time
         self._sync_timing_display()
-
-        self.state = {}
 
         # Enum to track the camera gui state
         self.camera_state = CameraState.READY
@@ -961,7 +963,10 @@ class SciCamGUI(QWidget):
         self.capture_thread.image_ready.connect(self.on_image_ready)
         self.capture_thread.notification.connect(self.send_notification)
 
-        self.update_status_indicators()
+        # First contact with the camera happens once the event loop is
+        # running, so the window and the command server come up immediately
+        # even if the camera is off (serial queries block ~2 s each).
+        QTimer.singleShot(0, self._initial_camera_contact)
 
         # Slow timer for status queries (5 seconds)
         self.status_timer = QTimer()
@@ -986,6 +991,122 @@ class SciCamGUI(QWidget):
         self.save_as_stack = False
         self.custom_filename = None
 
+    # ------------------------------------------------------------------
+    # Camera connection management
+    # ------------------------------------------------------------------
+    def _initial_camera_contact(self):
+        """First camera contact after startup (runs from the event loop)."""
+        self._load_timing_from_camera()
+        self.update_status_indicators()
+
+    def _load_timing_from_camera(self):
+        """Read exposure and frame period from the camera and adopt them.
+
+        Falls back to the current/default values if the camera does not
+        answer. Returns True if both values were read.
+        """
+        ok = True
+        self.exp_input.blockSignals(True)
+        current_cycles = self._query_cycles("SENS:EXPPER?")
+        if current_cycles is not None:
+            current_exp_seconds = cycles_to_sec(current_cycles)
+            self.exp_input.setValue(current_exp_seconds)
+            self.current_exposure_time = current_exp_seconds
+            self.print_terminal(f"Current camera exposure: {current_exp_seconds:.6f}s")
+        else:
+            ok = False
+            self.print_terminal(
+                f"Could not read exposure from camera, using {self.current_exposure_time}s"
+            )
+            self.exp_input.setValue(self.current_exposure_time)
+        self.exp_input.blockSignals(False)
+
+        current_frame_cycles = self._query_cycles("SENS:FRAMEPER?")
+        if current_frame_cycles is not None:
+            self.current_frame_time = cycles_to_sec(current_frame_cycles)
+            self.print_terminal(
+                f"Current camera frame time: {self.current_frame_time:.6f}s"
+            )
+        else:
+            ok = False
+            self.print_terminal(
+                "Could not read frame period from camera, assuming "
+                f"exposure + {self.frame_time_overhead}s"
+            )
+            self.current_frame_time = (
+                self.current_exposure_time + self.frame_time_overhead
+            )
+        self.fixed_frame_time = self.current_frame_time
+        self._sync_timing_display()
+        if ok:
+            self._needs_timing_resync = False
+        return ok
+
+    def _set_camera_connection_label(self, connected, detail=""):
+        label = getattr(self, "camera_conn_label", None)
+        if label is None:
+            return
+        if connected:
+            label.setText("Camera: connected")
+            label.setStyleSheet("font-weight: bold; color: green;")
+        else:
+            label.setText(
+                f"Camera: NOT CONNECTED ({detail}), "
+                f"retrying every {self.CAMERA_PROBE_INTERVAL_S:.0f} s"
+            )
+            label.setStyleSheet("font-weight: bold; color: red;")
+
+    def _set_camera_connected(self, connected, reason=""):
+        """Record whether the camera answers on the serial link.
+
+        Idempotent: repeated calls with the same value do nothing. A loss is
+        "declared" once (message, probe cadence, indicators) whether the
+        camera was connected before or never answered at all.
+        """
+        if connected:
+            if self.camera_connected:
+                return
+            self.camera_connected = True
+            self._disconnect_declared = False
+            self.state.update({"camera_connected": True})
+            self.print_terminal("Camera connected")
+            self._set_camera_connection_label(True)
+            if self._needs_timing_resync:
+                # re-read timing and refresh status outside the current call
+                # chain (we may be inside query_scalar right now)
+                QTimer.singleShot(0, self._on_camera_reconnected)
+        else:
+            if self._disconnect_declared:
+                return
+            self._disconnect_declared = True
+            self.camera_connected = False
+            self.state.update({"camera_connected": False})
+            self.print_terminal(
+                f"Camera NOT connected ({reason}); "
+                f"probing every {self.CAMERA_PROBE_INTERVAL_S:.0f} s"
+            )
+            self._needs_timing_resync = True
+            self._last_probe_time = time.time()
+            self.state.update({"tec_lock": 0})
+            self.capture_button.setEnabled(False)
+            self.tec_lock_light.setStyleSheet(
+                "background-color: red; border-radius: 8px;"
+            )
+            self._set_camera_connection_label(False, reason)
+
+    def _on_camera_reconnected(self):
+        """Re-adopt camera timing and do a full status refresh."""
+        self._load_timing_from_camera()
+        self.update_status_indicators()
+
+    def _probe_camera(self):
+        """While disconnected: one reconnect attempt per probe interval."""
+        if time.time() - self._last_probe_time < self.CAMERA_PROBE_INTERVAL_S:
+            return
+        self._last_probe_time = time.time()
+        self.print_terminal("Probing camera...")
+        self.attempt_serial_reconnect()
+
     def start_command_server(self, port):
         """Start the TCP/IP command server"""
         self.command_server = CommandServer(port)
@@ -1002,7 +1123,13 @@ class SciCamGUI(QWidget):
 
             response = {"status": "error", "message": "Unknown command"}
 
-            if cmd_type == "CAPTURE":
+            if cmd_type in self.CAMERA_COMMANDS and not self.camera_connected:
+                response = {
+                    "status": "error",
+                    "message": "camera not connected (no response on serial link)",
+                }
+
+            elif cmd_type == "CAPTURE":
                 nframes = cmd_data.get("nframes", 1)
                 self.nframes_input.setText(str(nframes))
 
@@ -1283,6 +1410,7 @@ class SciCamGUI(QWidget):
                         "last_exposure_duration", None
                     ),
                     "serial_error_count": self.serial_error_count,
+                    "camera_connected": self.camera_connected,
                 }
                 response = {"status": "success", "data": status}
 
@@ -1366,7 +1494,9 @@ class SciCamGUI(QWidget):
         tec_locked = self.state.get("tec_lock", 0) == 1
 
         # Check what CameraState we are in
-        if self.is_capturing:
+        if not self.camera_connected:
+            self.camera_state = CameraState.ERROR
+        elif self.is_capturing:
             self.camera_state = CameraState.EXPOSING
         elif self.waiting_on_exposure_update:
             self.camera_state = CameraState.SETTING_EXPOSURE
@@ -1394,7 +1524,10 @@ class SciCamGUI(QWidget):
             self.camera_state_label.setStyleSheet("font-weight: bold; color: red;")
 
         is_ready = (
-            not self.waiting_on_exposure_update and tec_locked and not self.is_capturing
+            self.camera_connected
+            and not self.waiting_on_exposure_update
+            and tec_locked
+            and not self.is_capturing
         )
         self.state.update({"ready": is_ready})
 
@@ -1541,6 +1674,10 @@ class SciCamGUI(QWidget):
         # Skip all serial queries if we're currently capturing
         if self.is_capturing:
             self.print_terminal("Skipping status queries during exposure")
+            return
+        elif not self.camera_connected:
+            # Don't burn ~25 s of serial timeouts; one probe per interval.
+            self._probe_camera()
             return
         else:
             # Query the camera status over the serial connection
@@ -1715,6 +1852,11 @@ class SciCamGUI(QWidget):
         self.camera_state_label = QLabel("State: READY")
         self.camera_state_label.setStyleSheet("font-weight: bold;")
         labels_layout.addWidget(self.camera_state_label)
+
+        # Camera (serial link) connection indicator
+        self.camera_conn_label = QLabel("Camera: not yet contacted")
+        self.camera_conn_label.setStyleSheet("font-weight: bold; color: red;")
+        labels_layout.addWidget(self.camera_conn_label)
 
         labels_layout.addWidget(self.soc_label)
         labels_layout.addWidget(QLabel("Gain Corr:"))
@@ -2261,37 +2403,51 @@ class SciCamGUI(QWidget):
             if values:
                 # Success - reset error count
                 self.serial_error_count = 0
+                self._set_camera_connected(True)
                 return values[-1]
             else:
                 # No response but no exception - might be communication issue
-                self.serial_error_count += 1
-                if self.serial_error_count >= self.max_serial_errors:
-                    self.print_terminal(
-                        f"Serial communication degraded ({self.serial_error_count} consecutive errors). "
-                        "Attempting reconnection..."
-                    )
-                    self.attempt_serial_reconnect()
+                self._note_serial_failure(
+                    f"no response to {command} ({self.serial_error_count + 1} consecutive errors)"
+                )
                 return None
 
         except Exception as e:
-            self.serial_error_count += 1
-            self.print_terminal(f"Error querying {command}: {e}")
-
-            if self.serial_error_count >= self.max_serial_errors:
-                self.print_terminal(
-                    f"Multiple serial errors detected ({self.serial_error_count}). "
-                    "Attempting reconnection..."
-                )
-                self.attempt_serial_reconnect()
+            self._note_serial_failure(f"error querying {command}: {e}")
             return None
 
+    def _note_serial_failure(self, detail):
+        """Count a failed query; after max_serial_errors, declare the camera
+        disconnected and make one reconnect attempt. While disconnected, the
+        probe timer owns reconnection (see _probe_camera), so nothing here
+        recurses."""
+        self.serial_error_count += 1
+        if self.serial_error_count < self.max_serial_errors:
+            return
+        if self._reconnecting:
+            return  # the reconnect attempt's own failure path handles it
+        if not self._disconnect_declared:
+            self.print_terminal(
+                f"Serial communication degraded: {detail}. Attempting reconnection..."
+            )
+            self._set_camera_connected(False, "serial link not responding")
+            self.attempt_serial_reconnect()
+
     def attempt_serial_reconnect(self):
-        """Attempt to reconnect serial communication"""
+        """Re-open the serial link and test it with one query.
+
+        Success/failure is recorded through query_scalar -> camera_connected;
+        camera_state follows camera_connected in update_time_fields.
+        Guarded so a failed test query cannot trigger a nested reconnect.
+        """
+        if self._reconnecting:
+            return False
+        self._reconnecting = True
         try:
             self.print_terminal("Closing existing serial connection...")
             try:
                 self.CL.SerialClose()
-            except:
+            except Exception:
                 pass  # Ignore errors when closing
 
             time.sleep(0.5)  # Give port time to release
@@ -2303,17 +2459,17 @@ class SciCamGUI(QWidget):
             test_response = self.query_scalar("SYS:MODEL?")
             if test_response:
                 self.print_terminal("Serial reconnection successful!")
-                self.serial_error_count = 0
-                self.camera_state = CameraState.READY
-            else:
-                self.print_terminal(
-                    "Serial reconnection failed - no response from camera"
-                )
-                self.camera_state = CameraState.ERROR
+                return True
+            self.print_terminal("Serial reconnection failed - no response from camera")
+            self._set_camera_connected(False, "no response from camera")
+            return False
 
         except Exception as e:
             self.print_terminal(f"Serial reconnection failed: {e}")
-            self.camera_state = CameraState.ERROR
+            self._set_camera_connected(False, f"serial error: {e}")
+            return False
+        finally:
+            self._reconnecting = False
 
     def enable_capture_button(self):
         """Re-enable capture button after exposure update completes"""
