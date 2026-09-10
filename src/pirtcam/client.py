@@ -77,14 +77,38 @@ class CaptureProgress:
 
 
 class CameraClient:
-    def __init__(self, host="localhost", port=5555):
+    # Default wait for a command reply. Long, because some GUI commands (e.g.
+    # SET_EXPOSURE with wait=True) legitimately take a while to answer.
+    DEFAULT_RESPONSE_TIMEOUT = 120.0
+    # GET_STATUS is answered from the GUI's cached state, so it should be fast.
+    # Still generous: the GUI main thread can stall for tens of seconds while
+    # its serial link to the camera is unhealthy (each serial query waits 2 s).
+    DEFAULT_STATUS_TIMEOUT = 30.0
+    DEFAULT_CONNECT_TIMEOUT = 5.0
+
+    def __init__(
+        self,
+        host="localhost",
+        port=5555,
+        response_timeout=DEFAULT_RESPONSE_TIMEOUT,
+        status_timeout=DEFAULT_STATUS_TIMEOUT,
+        connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+    ):
         self.host = host
         self.port = port
+        self.response_timeout = response_timeout
+        self.status_timeout = status_timeout
+        self.connect_timeout = connect_timeout
         self.socket = None
         self.receive_thread = None
         self.response_queue = Queue()
         self.notification_queue = Queue()
         self.running = False
+        # Connection health. ``connected`` goes False the moment the receive
+        # loop sees the server go away, so callers fail fast instead of
+        # waiting out a full response timeout on a dead socket.
+        self.connected = False
+        self.last_error = None
         self.current_capture: Optional[CaptureProgress] = None
         self.capture_history: List[CaptureProgress] = []
         self.progress_callbacks: List[Callable[[CaptureProgress], None]] = []
@@ -105,26 +129,63 @@ class CameraClient:
         return False
 
     def connect(self):
-        """Connect to the camera GUI server"""
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.connect((self.host, self.port))
-        self.socket.settimeout(0.1)  # Non-blocking receive
+        """Connect to the camera GUI server.
+
+        Raises ``OSError`` (``ConnectionRefusedError``, ``socket.timeout``, ...)
+        if the server cannot be reached within ``connect_timeout``.
+        """
+        # Tear down any previous session so a reconnect never leaves a
+        # zombie receive thread or half-open socket behind.
+        if self.socket is not None or self.receive_thread is not None:
+            self.disconnect()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.connect_timeout)
+        try:
+            sock.connect((self.host, self.port))
+        except OSError as e:
+            sock.close()
+            self.last_error = f"connect failed: {e}"
+            raise
+        sock.settimeout(0.1)  # Non-blocking receive
+        self.socket = sock
+        self.last_error = None
         print(f"Connected to camera server at {self.host}:{self.port}")
 
         # Start receive thread
         self.running = True
+        self.connected = True
         self.receive_thread = threading.Thread(target=self._receive_loop)
         self.receive_thread.daemon = True
         self.receive_thread.start()
 
     def disconnect(self):
-        """Disconnect from the server"""
+        """Disconnect from the server. Safe to call repeatedly."""
         self.running = False
-        if self.receive_thread:
-            self.receive_thread.join(timeout=1)
+        self.connected = False
+        thread = self.receive_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
+        self.receive_thread = None
         if self.socket:
-            self.socket.close()
+            try:
+                self.socket.close()
+            except OSError:
+                pass
             self.socket = None
+
+    # ``close`` is the name the SUMMER client uses; keep both spellings so the
+    # WSP camera daemons can treat the two clients identically.
+    close = disconnect
+
+    def is_connected(self):
+        """True while the socket is open and the receive loop is alive."""
+        return (
+            self.connected
+            and self.socket is not None
+            and self.receive_thread is not None
+            and self.receive_thread.is_alive()
+        )
 
     def add_progress_callback(self, callback: Callable[[CaptureProgress], None]):
         """Add a callback to be called when capture progress updates"""
@@ -169,8 +230,16 @@ class CameraClient:
                 continue
             except Exception as e:
                 if self.running:
+                    self.last_error = f"receive error: {e}"
                     print(f"Receive error: {e}")
                 break
+
+        # Reaching here means the server closed the connection (recv returned
+        # b"") or the socket errored. Flag it so send_command fails fast.
+        if self.running:
+            if self.last_error is None:
+                self.last_error = "server closed the connection"
+            self.connected = False
 
     def _update_capture_progress(self, notification: Dict):
         """Update current capture progress"""
@@ -202,33 +271,69 @@ class CameraClient:
                 except Exception as e:
                     print(f"Progress callback error: {e}")
 
-    def send_command(self, command_dict):
-        """Send a command and wait for response"""
-        if not self.socket:
-            raise Exception("Not connected to server")
+    def send_command(self, command_dict, timeout=None):
+        """Send a command and wait for its reply.
+
+        Args:
+            command_dict: JSON-serializable command.
+            timeout: Seconds to wait for the reply. Defaults to
+                ``self.response_timeout``.
+
+        Returns:
+            The reply dict. If the server stays silent for ``timeout`` seconds
+            the reply is ``{"status": "error", "message": "Response timeout"}``
+            (the link is still up; the GUI is just not answering).
+
+        Raises:
+            ConnectionError: if the client is not connected, or the server
+                closes the connection before replying. Callers (e.g. the WSP
+                camera daemon) treat this as "the GUI is gone" and reconnect.
+        """
+        if not self.is_connected():
+            raise ConnectionError(
+                f"Not connected to camera server ({self.last_error or 'no session'})"
+            )
+
+        if timeout is None:
+            timeout = self.response_timeout
 
         # Clear response queue
         while not self.response_queue.empty():
             self.response_queue.get()
 
         # Send command with newline delimiter
-        command_json = json.dumps(command_dict) + "\n"  # ADD THIS NEWLINE
+        command_json = json.dumps(command_dict) + "\n"
         if hasattr(self, "_debug") and self._debug:
             print(
                 f"[CLIENT DEBUG] Sending: {command_json[:200]}..."
             )  # Truncate long messages
-        self.socket.send(command_json.encode("utf-8"))
-
-        # Wait for primary response
         try:
-            response = self.response_queue.get(
-                timeout=120.0
-            )  # Increased timeout for long waits
+            self.socket.sendall(command_json.encode("utf-8"))
+        except OSError as e:
+            self.connected = False
+            self.last_error = f"send failed: {e}"
+            raise ConnectionError(self.last_error) from e
+
+        # Wait for primary response. Poll in short slices so a connection
+        # that dies mid-wait is reported immediately instead of after the
+        # full timeout.
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return {"status": "error", "message": "Response timeout"}
+            try:
+                response = self.response_queue.get(timeout=min(0.5, remaining))
+            except Empty:
+                if not self.is_connected():
+                    raise ConnectionError(
+                        f"Connection lost while waiting for reply "
+                        f"({self.last_error or 'unknown'})"
+                    )
+                continue
             if hasattr(self, "_debug") and self._debug:
                 print(f"[CLIENT DEBUG] Received: {response}")
             return response
-        except Empty:
-            return {"status": "error", "message": "Response timeout"}
 
     def capture_frames(
         self,
@@ -789,9 +894,15 @@ class CameraClient:
         """
         return self.send_command({"command": "SET_FILENAME", "filename": filename})
 
-    def get_status(self):
-        """Get current camera status"""
-        return self.send_command({"command": "GET_STATUS"})
+    def get_status(self, timeout=None):
+        """Get current camera status.
+
+        Uses ``self.status_timeout`` by default (shorter than the general
+        response timeout, since GET_STATUS is served from cached GUI state).
+        """
+        if timeout is None:
+            timeout = self.status_timeout
+        return self.send_command({"command": "GET_STATUS"}, timeout=timeout)
 
     def print_status(self):
         status = self.get_status()
