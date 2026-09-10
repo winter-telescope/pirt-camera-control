@@ -42,6 +42,67 @@ always answers. When the camera answers again the GUI re-reads exposure and
 frame period and returns to normal operation by itself. Startup no longer
 waits on the camera: the window and command server come up first.
 
+## GUI watchdog (`pirtcam-watchdog`)
+
+`pirtcam-watchdog` keeps the GUI alive on the camera computer. It probes the
+GUI with the same `GET_STATUS` command remote clients use and restarts the GUI
+when the process is gone (within one probe interval, default 10 s) or when a
+running GUI has not answered for `hang_timeout` seconds (default 180 s,
+deliberately long because the GUI main thread can stall for tens of seconds
+when the camera serial link is unhealthy). A GUI that answers probes is never
+touched, even one started by hand, and a GUI whose camera is off is not
+restarted either (it answers with `camera_connected: false`).
+
+Nothing site-specific lives in this package: put the launch command, paths and
+timings in a JSON file and point the watchdog at it. Example `watchdog.json`,
+kept next to your GUI launcher, not in this repository:
+
+```json
+{
+  "launch": "C:\\Users\\me\\start_gui.bat",
+  "host": "localhost",
+  "port": 5555,
+  "log_dir": "C:\\Users\\me\\watchdog_logs",
+  "interval": 10,
+  "hang_timeout": 180,
+  "startup_grace": 120
+}
+```
+
+```bash
+pirtcam-watchdog --config C:\Users\me\watchdog.json
+```
+
+`launch` may be a string (an existing file such as a `.bat` launcher is used
+as-is; anything else is split like a command line) or a JSON list of
+arguments, which is the safest form for paths containing spaces or
+backslashes. Accepted keys: `launch`, `host`, `port`, `interval`,
+`probe_timeout`, `hang_timeout`, `startup_grace`, `restart_cooldown`,
+`max_restarts_per_hour`, `cwd`, `log_dir`, `pause_file`, `status_file`,
+`gui_patterns`. Command-line flags of the same names override the file.
+
+Useful options and files:
+
+- `--dry-run` logs what it would do without killing or launching anything.
+  Run this first for a few minutes on a new machine.
+- `--once` runs a single probe and exits 0/1.
+- Create `<log_dir>/watchdog.pause` to make the watchdog stand down while you
+  work on the GUI by hand; delete it to resume.
+- `<log_dir>/watchdog.log` is the watchdog's own log, `gui_<timestamp>.log`
+  captures the GUI's stdout/stderr for each launch (so a crashing GUI leaves
+  its traceback behind), and `watchdog_status.json` is rewritten after every
+  probe.
+- Restarts are rate limited (`restart_cooldown`, `max_restarts_per_hour`) so a
+  GUI that dies on startup cannot be relaunched in a tight loop.
+
+The GUI process is found by its command line (`pirtcam.gui` or
+`pirtcam/gui.py`, any path), and restarts kill the whole process tree, so a
+launcher script that activates an environment and then runs `gui.py` works
+unchanged. On Windows the GUI needs a desktop session, so run the watchdog at
+user logon (a Startup-folder shortcut, or a Task Scheduler task triggered "At
+log on" set to run only when the user is logged on) and let the watchdog be
+the only thing that launches the GUI.
+
 ## Workflow for updating tags
 Check the current version:
 ```bash:

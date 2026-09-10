@@ -24,7 +24,11 @@ dependencies = [
     "matplotlib",
     "pyqtgraph",
     "Pyro5",
+    "psutil",
 ]
+
+[project.scripts]
+pirtcam-watchdog = "pirtcam.watchdog:main"
 
 [project.optional-dependencies]
 dev = [
