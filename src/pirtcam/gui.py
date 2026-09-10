@@ -20,6 +20,12 @@ import numpy as np
 import pyqtgraph as pg
 from astropy.io import fits
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+
+try:
+    # normal case: package installed (pip install -e .)
+    from pirtcam.command_server import CommandServer
+except ImportError:  # running gui.py as a bare script from src/pirtcam
+    from command_server import CommandServer
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -89,114 +95,6 @@ def sec_to_cycles(seconds: float) -> int:
 def cycles_to_sec(cycles: float) -> float:
     """Convert camera clock cycles to seconds."""
     return cycles / CLOCK_FREQ_HZ
-
-
-class CommandServer(QThread):
-    """TCP/IP server running in separate thread to handle remote commands"""
-
-    command_received = pyqtSignal(str)
-
-    def __init__(self, port=5555):
-        super().__init__()
-        self.port = port
-        self.server = None
-        self.running = False
-        self.clients = []
-
-    def run(self):
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(("0.0.0.0", self.port))
-        self.server.listen(5)
-        self.server.settimeout(1.0)  # Allow checking self.running periodically
-        self.running = True
-
-        print(f"Command server listening on port {self.port}")
-
-        while self.running:
-            try:
-                client, addr = self.server.accept()
-                print(f"Client connected from {addr}")
-                client.settimeout(1.0)
-                client_thread = threading.Thread(
-                    target=self.handle_client, args=(client,)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"Server error: {e}")
-
-    def handle_client(self, client):
-        """Handle individual client connections"""
-        self.clients.append(client)
-        buffer = ""  # Buffer to accumulate data
-
-        try:
-            while self.running:
-                try:
-                    data = client.recv(4096)
-                    if not data:
-                        break
-
-                    # Decode and add to buffer
-                    buffer += data.decode("utf-8")
-
-                    # Process complete messages (newline-delimited)
-                    while True:
-                        # Look for newline delimiter
-                        newline_index = buffer.find("\n")
-                        if newline_index == -1:
-                            # No complete message yet
-                            break
-
-                        # Extract the complete message
-                        command = buffer[:newline_index]
-                        buffer = buffer[newline_index + 1 :]  # Keep remainder in buffer
-
-                        command = command.strip()
-                        if command:
-                            # Only print received command if it's not GET_STATUS
-                            try:
-                                cmd_data = json.loads(command)
-                                if cmd_data.get("command", "").upper() != "GET_STATUS":
-                                    print(
-                                        f"Received command: {command[:100]}..."
-                                    )  # Print first 100 chars
-                            except:
-                                # If we can't parse it, print it anyway
-                                print(
-                                    f"Received command: {command[:100]}..."
-                                )  # Print first 100 chars
-                            self.command_received.emit(command)
-
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    print(f"Client error: {e}")
-                    break
-        finally:
-            self.clients.remove(client)
-            client.close()
-
-    def send_response(self, response):
-        """Send response to all connected clients"""
-        response_data = (response + "\n").encode("utf-8")
-        for client in self.clients[
-            :
-        ]:  # Copy list to avoid modification during iteration
-            try:
-                client.send(response_data)
-            except:
-                self.clients.remove(client)
-
-    def stop(self):
-        self.running = False
-        if self.server:
-            self.server.close()
-        for client in self.clients:
-            client.close()
 
 
 class ImageViewer(QWidget):
@@ -1114,8 +1012,13 @@ class SciCamGUI(QWidget):
         self.command_server.start()
         self.print_terminal(f"TCP/IP command server started on port {port}")
 
-    def process_remote_command(self, command):
-        """Process commands received from TCP/IP clients"""
+    def process_remote_command(self, command, client_id=None):
+        """Process commands received from TCP/IP clients.
+
+        ``client_id`` identifies the requesting connection so the reply goes
+        back to that client only (see command_server.py). Notifications are
+        still broadcast via send_notification().
+        """
         try:
             # Parse JSON command
             cmd_data = json.loads(command)
@@ -1140,7 +1043,7 @@ class SciCamGUI(QWidget):
                 if not self.capture_button.isEnabled():
                     response = {"status": "error", "message": "TEC not locked"}
                     if self.command_server:
-                        self.command_server.send_response(json.dumps(response) + "\n")
+                        self.command_server.send_response(json.dumps(response), client_id=client_id)
                     return
 
                 # Immediate ACK before starting the long/async work
@@ -1154,7 +1057,7 @@ class SciCamGUI(QWidget):
                         f"Sending response: {ack['status']} - {ack.get('message','')}"
                     )
                     try:
-                        self.command_server.send_response(json.dumps(ack) + "\n")
+                        self.command_server.send_response(json.dumps(ack), client_id=client_id)
                     except Exception as e:
                         self.print_terminal(f"Failed to send ACK: {e}")
                         return  # don't proceed if we can't talk to the client
@@ -1197,7 +1100,7 @@ class SciCamGUI(QWidget):
                         self.print_terminal(
                             f"Sending response: {response['status']} - {response.get('message', '')}"
                         )
-                        self.command_server.send_response(json.dumps(response))
+                        self.command_server.send_response(json.dumps(response), client_id=client_id)
                     return  # Don't send response again at the end
                 else:
                     response = {
@@ -1233,7 +1136,7 @@ class SciCamGUI(QWidget):
                         self.print_terminal(
                             f"Sending response: {response['status']} - {response.get('message', '')}"
                         )
-                        self.command_server.send_response(json.dumps(response))
+                        self.command_server.send_response(json.dumps(response), client_id=client_id)
                     return
                 else:
                     response = {
@@ -1473,19 +1376,19 @@ class SciCamGUI(QWidget):
                     self.print_terminal(
                         f"Sending response: {response['status']} - {response.get('message', '')}"
                     )
-                self.command_server.send_response(json.dumps(response))
+                self.command_server.send_response(json.dumps(response), client_id=client_id)
 
         except json.JSONDecodeError:
             response = {"status": "error", "message": "Invalid JSON command"}
             if self.command_server:
-                self.command_server.send_response(json.dumps(response))
+                self.command_server.send_response(json.dumps(response), client_id=client_id)
             import traceback
 
             self.print_terminal(f"Error processing command: {traceback.format_exc()}")
         except Exception as e:
             response = {"status": "error", "message": str(e)}
             if self.command_server:
-                self.command_server.send_response(json.dumps(response))
+                self.command_server.send_response(json.dumps(response), client_id=client_id)
             self.print_terminal(f"Error processing command: {e}")
 
     def update_time_fields(self):

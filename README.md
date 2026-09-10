@@ -16,6 +16,18 @@ Try this:
 5. Update pip: `pip install --upgrade pip`
 6. Install dependencies: `pip install -e .` Alternately if you want to install the dev dependencies: `pip install -e ".[dev]"`
 
+## Remote command protocol notes
+
+The GUI runs a TCP/IP JSON command server on port 5555 (`src/pirtcam/command_server.py`).
+Clients send newline-delimited JSON such as `{"command": "GET_STATUS"}` and get
+a newline-delimited JSON reply. Replies go only to the client that sent the
+command; `{"event": ...}` notifications (frame saved, capture complete, ...) are
+broadcast to every connected client, so several clients (e.g. the WSP camera
+daemon and a health probe) can share the port safely.
+`pirtcam.client.CameraClient.send_command()` raises `ConnectionError` as soon
+as the GUI closes the socket, so callers can reconnect instead of waiting out a
+response timeout.
+
 ## Behavior when the camera is not responding
 
 The GUI keeps running if the camera is off or the Camera Link serial link
